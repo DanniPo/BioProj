@@ -1,0 +1,5 @@
+model,ROC-AUC,PR-AUC,balanced accuracy,sensitivity (TNBC recall),specificity,F1 (TNBC)
+Majority class (dummy),0.5,0.158,0.5,0.0,1.0,0.0
+Proliferation score only (LR),0.835,0.563,0.789,0.812,0.765,0.531
+DNA-repair genes (LR),0.926,0.662,0.871,0.812,0.929,0.743
+DNA-repair genes (random forest),0.915,0.663,0.698,0.438,0.959,0.528

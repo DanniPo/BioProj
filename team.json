@@ -1,0 +1,22 @@
+{
+  "_comment": "Who leads each stage. Edit names/usernames here if you swap roles; build_notebook.py writes the lead's name under each stage heading.",
+  "members": {
+    "wanyoike": {"name": "Wanyoike Samuel Macharia", "github": "github-username"},
+    "arop":     {"name": "Arop Mary Abiong",         "github": "github-username"},
+    "dylan":    {"name": "Dylan Saisi",              "github": "github-username"},
+    "pete":     {"name": "Pete Njagi",               "github": "github-username"},
+    "danni":    {"name": "Danni Podho",              "github": "github-username"},
+    "kian":     {"name": "Kian Mwiberi",             "github": "github-username"}
+  },
+  "stages": {
+    "01_question_and_objectives":   "wanyoike",
+    "02_data_acquisition":          "wanyoike",
+    "03_preprocessing_qc":          "arop",
+    "04_eda":                       "dylan",
+    "05_core_analysis_de":          "pete",
+    "06_biological_interpretation": "kian",
+    "07_machine_learning":          "danni",
+    "08_conclusions":               "dylan"
+  },
+  "maintainer": "danni"
+}
