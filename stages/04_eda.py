@@ -84,11 +84,33 @@ cg.fig.legend(handles=handles, loc="lower center", ncol=9, bbox_to_anchor=(0.55,
 cg.fig.suptitle("DNA-repair gene expression across 1,006 tumours (rows and columns clustered)", y=1.01)
 plt.show()
 
+# %%
+# Which genes drive PC1 of the repair-gene PCA? PC1 is the proliferation axis (see above),
+# so its loadings name the repair genes that move with proliferation in TNBC.
+Xr = (logn.loc[repair_present].T - logn.loc[repair_present].T.mean()) / logn.loc[repair_present].T.std()
+rep_pca = PCA(n_components=2, random_state=SEED).fit(Xr)
+load1 = pd.Series(rep_pca.components_[0], index=repair_present)
+score1 = rep_pca.transform(Xr)[:, 0]
+if stats.spearmanr(score1, prolif_score)[0] < 0:          # PC1 sign is arbitrary; orient it so that
+    load1 = -load1                                         # the positive end = high-proliferation / TNBC
+load1 = load1.sort_values()
+top = pd.concat([load1.head(12), load1.tail(12)])          # 12 lowest + 12 highest loadings
+fig, ax = plt.subplots(figsize=(6, 8))
+ax.barh(repair.loc[top.index, "symbol"], top.values,
+        color=["#C0392B" if v > 0 else "#2471A3" for v in top.values])
+ax.axvline(0, color="k", lw=0.6)
+ax.set(title="Genes loading on PC1 of the repair-gene PCA\n(positive end = high-proliferation / TNBC direction)",
+       xlabel="PC1 loading")
+plt.tight_layout(); plt.show()
+print("High-proliferation end:", ", ".join(repair.loc[load1.tail(8).index[::-1], "symbol"]))
+print("Opposite end:         ", ", ".join(repair.loc[load1.head(8).index, "symbol"]))
+
 # %% [markdown]
 # **Interpretation (Stage 4).** 
 #
 # * **Cohort:** TNBC patients are younger (median age 54 vs 60, p = 1 × 10⁻⁴) and much more often Black / African American (33.8% vs 13.7%, p ≈ 10⁻⁸). This matches the epidemiology of TNBC (Carey et al., 2006). It also shows the representation problem from our ethics presentation: most patients are White (57–70%), about 5% are Asian, and none were recruited in Africa.
 # * **Genome-wide PCA:** TNBC tumours form their own cluster at the negative end of PC1. TNBC differs across the whole transcriptome, not just in a few genes; this is the basal-like phenotype.
 # * **Repair-gene PCA:** using only the 148 repair genes, TNBC still shift along PC1 (AUC 0.78). But repair-gene PC1 is strongly correlated with the proliferation score (ρ = 0.81), so the main axis of variation among repair genes is a **proliferation axis**.
+# * **What drives repair-gene PC1:** the positive (high-proliferation / TNBC) end of PC1 is built from replication-coupled HR and Fanconi-anaemia genes together with S-phase checkpoint and mismatch-repair genes (*RAD51AP1, BLM, EXO1, FANCB, FANCI, FANCD2, MSH2, MSH6, CHEK1, TOPBP1, DNA2, NEIL3*) — genes that are switched on in dividing cells. Because these same genes define PC1 and PC1 tracks the proliferation score (ρ = 0.81), the main "repair" axis is really a **cell-cycle axis**: the repair genes that look high in TNBC are largely the ones expressed in proliferating tumours. The opposite end carries base- and nucleotide-excision-repair genes and back-up / translesion polymerases (*NEIL1, MPG, POLM, POLL, POLN, POLD4, PARP3, FAAP20, ERCC1, XPA, CCNH, ATRIP*), repair activities that are not replication-coupled. This is exactly why Stage 5 removes the proliferation effect before trusting any repair-specific difference.
 # * **Repair vs proliferation:** the average repair score tracks proliferation closely (ρ = 0.76). TNBC sit at the high-proliferation end (median proliferation z-score 0.95 vs −0.09), yet their mean repair score is only slightly higher (0.14 vs −0.04). Averaging over all repair genes hides genes that move in opposite directions.
 # * **Heatmap:** clustering places most TNBC tumours together in one block of columns. In that block, a large group of HR, FA and replication genes (*BLM, FANCA, FANCD2, FANCI, RAD51, RAD51AP1, EXO1, CHEK1, BRCA2, UBE2T …*) is high. A smaller set (*RAD50, MSH3, POLK, XPC …*) is low in part of the same block. Stage 5 tests both patterns formally.
