@@ -23,7 +23,7 @@ def assemble():
     team = json.loads((ROOT / "team.json").read_text())
     parts, first_header = [], None
     for path in sorted(STAGES.glob("[0-9][0-9]_*.py")):
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         header = HEADER.match(text)
         if header and first_header is None:
             first_header = header.group(0)
@@ -86,7 +86,7 @@ def main():
 
     nbformat.write(new_nb, args.output)
     if args.output == NOTEBOOK:
-        SCRIPT.write_text(text)
+        SCRIPT.write_text(text, encoding="utf-8")
     print(f"wrote {args.output.name}" + (f" and {SCRIPT.name}" if args.output == NOTEBOOK else ""))
 
 

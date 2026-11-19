@@ -1,3 +1,4 @@
+
 # ---
 # jupyter:
 #   jupytext:
@@ -12,205 +13,1826 @@
 
 # %% [markdown]
 # ## Stage 3 · Preprocessing and quality control
+#
+# This stage performs:
+# 1. Count-matrix integrity checks.
+# 2. Primary tumour selection and TNBC classification.
+# 3. Sequencing-depth quality control.
+# 4. Low-expression gene filtering.
+# 5. Filtering sensitivity analysis.
+# 6. Count normalisation.
+# 7. Biological sanity checks.
+# 8. ESR1-discordant TNBC investigation.
+
+# %%
+# ============================================================
+# 3.0 IMPORTS AND INPUT VALIDATION
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy import stats
+from IPython.display import display
+
+required_objects = [
+    "counts_raw",
+    "bcr",
+    "gdc_patient",
+    "repair",
+    "MARKERS",
+    "PROLIF",
+    "GROUP_COLORS",
+    "SEED"
+]
+
+missing_objects = [
+    name for name in required_objects
+    if name not in globals()
+]
+
+if missing_objects:
+    raise NameError(
+        "Stage 3 is missing outputs from earlier stages: "
+        + ", ".join(missing_objects)
+        + ". Run the earlier stages before Stage 3."
+    )
+
+for name, obj in [
+    ("counts_raw", counts_raw),
+    ("bcr", bcr),
+    ("gdc_patient", gdc_patient),
+    ("repair", repair)
+]:
+    if not isinstance(obj, pd.DataFrame):
+        raise TypeError(f"{name} must be a pandas DataFrame.")
+
+if counts_raw.empty:
+    raise ValueError("The raw count matrix is empty.")
+
+if "symbol" not in repair.columns:
+    raise KeyError(
+        "The repair DataFrame must contain a 'symbol' column."
+    )
+
+print("Stage 3 inputs successfully loaded.")
+print("Raw count matrix shape:", counts_raw.shape)
+
 
 # %% [markdown]
 # ### 3.1 Integrity of the count matrix
+#
+# Check missing values, negative values, non-integer counts
+# and duplicated gene or sample identifiers.
+#
+# Duplicated gene IDs are combined by summing their counts.
+# To reduce memory use, only duplicated rows are grouped.
 
 # %%
-print("missing values      :", int(counts_raw.isna().sum().sum()))
-print("negative counts     :", int((counts_raw < 0).sum().sum()))
-print("non-integer counts  :", int((counts_raw % 1 != 0).sum().sum()))
-dup_genes = counts_raw.index.duplicated(keep=False)
-print("duplicated gene IDs :", counts_raw.index[dup_genes].nunique(), "IDs appear on", int(dup_genes.sum()), "rows")
-print("duplicated samples  :", int(counts_raw.columns.duplicated().sum()))
+# ============================================================
+# 3.1 COUNT MATRIX INTEGRITY
+# ============================================================
 
-# Some Entrez IDs map to more than one GENCODE gene (e.g. X/Y pseudo-autosomal copies).
-# Reads from those rows belong to the same Entrez gene, so we sum them.
-counts_all = counts_raw.groupby(level=0).sum()
-print("genes after merging duplicated IDs:", counts_all.shape[0])
+print("COUNT MATRIX INTEGRITY")
+print("=" * 45)
+
+counts_raw = counts_raw.copy()
+counts_raw.columns = counts_raw.columns.astype(str)
+
+# Check that the matrix contains numeric values.
+
+if not all(
+    pd.api.types.is_numeric_dtype(dtype)
+    for dtype in counts_raw.dtypes
+):
+    raise TypeError(
+        "The count matrix contains non-numeric columns."
+    )
+
+# Check count values.
+
+missing_values = int(
+    counts_raw.isna().to_numpy().sum()
+)
+
+if missing_values > 0:
+    raise ValueError(
+        f"The count matrix contains {missing_values:,} missing values."
+    )
+
+negative_counts = int(
+    (counts_raw < 0).to_numpy().sum()
+)
+
+if negative_counts > 0:
+    raise ValueError(
+        f"The count matrix contains {negative_counts:,} negative values."
+    )
+
+non_integer_counts = int(
+    (counts_raw % 1 != 0).to_numpy().sum()
+)
+
+if non_integer_counts > 0:
+    raise ValueError(
+        f"The count matrix contains {non_integer_counts:,} non-integer values."
+    )
+
+duplicate_sample_columns = int(
+    counts_raw.columns.duplicated().sum()
+)
+
+if duplicate_sample_columns > 0:
+    raise ValueError(
+        "The count matrix contains duplicated sample columns."
+    )
+
+duplicate_mask = counts_raw.index.duplicated(keep=False)
+
+duplicate_gene_ids = int(
+    counts_raw.index[duplicate_mask].nunique()
+)
+
+duplicate_gene_rows = int(
+    duplicate_mask.sum()
+)
+
+print("Missing values:", missing_values)
+print("Negative counts:", negative_counts)
+print("Non-integer counts:", non_integer_counts)
+print("Duplicated gene IDs:", duplicate_gene_ids)
+print("Rows belonging to duplicated gene IDs:", duplicate_gene_rows)
+print("Duplicated sample columns:", duplicate_sample_columns)
+
+# Use int32 where possible to reduce memory consumption.
+# Fall back to int64 if the raw counts are too large.
+
+maximum_count = int(counts_raw.to_numpy().max())
+
+if maximum_count <= np.iinfo(np.int32).max:
+    counts_raw = counts_raw.astype(np.int32)
+    print("Count storage: int32 (memory-efficient)")
+else:
+    counts_raw = counts_raw.astype(np.int64)
+    print("Count storage: int64")
+
+# Aggregate only duplicated gene IDs.
+
+if duplicate_gene_rows > 0:
+
+    # Keep the rows with unique gene IDs.
+    counts_unique = counts_raw.loc[
+        ~duplicate_mask
+    ]
+
+    # Select only duplicated rows.
+    counts_duplicates = counts_raw.loc[
+        duplicate_mask
+    ].astype(np.int64)
+
+    # Sum the duplicated gene IDs.
+    counts_duplicates_aggregated = (
+        counts_duplicates
+        .groupby(level=0, sort=False)
+        .sum()
+    )
+
+    if (
+        counts_duplicates_aggregated.to_numpy().max()
+        > np.iinfo(np.int32).max
+        and counts_raw.dtypes.iloc[0] == np.dtype("int32")
+    ):
+        raise OverflowError(
+            "Aggregated counts exceed the int32 limit. "
+            "Use int64 for the count matrix."
+        )
+
+    counts_duplicates_aggregated = (
+        counts_duplicates_aggregated
+        .astype(counts_raw.dtypes.iloc[0])
+    )
+
+    # Combine unique and aggregated rows.
+    counts_all = pd.concat([
+        counts_unique,
+        counts_duplicates_aggregated
+    ])
+
+else:
+    counts_all = counts_raw
+
+# Sort the final gene index.
+counts_all = counts_all.sort_index()
+
+if counts_all.index.has_duplicates:
+    raise ValueError(
+        "Duplicate gene IDs remain after aggregation."
+    )
+
+print("\nDuplicate gene IDs aggregated successfully.")
+print("Updated count matrix shape:", counts_all.shape)
+print("Remaining duplicated gene IDs:", counts_all.index.duplicated().sum())
+print("Unique genes:", f"{counts_all.shape[0]:,}")
+print("Samples:", f"{counts_all.shape[1]:,}")
+
 
 # %% [markdown]
-# ### 3.2 Sample selection and TNBC labels
+# ### 3.2 Sample selection and TNBC classification
 #
-# * Keep **primary tumours** only (barcode type `01`) and one sample per patient.
-# * **HER2:** positive if IHC is 3+/positive **or** FISH shows amplification. Negative if FISH is negative, or IHC is negative with no positive FISH. Otherwise (e.g. IHC equivocal with no FISH) it is *unknown*.
-# * **TNBC** = ER-negative **and** PR-negative **and** HER2-negative. **non-TNBC** = ER-, PR- or HER2-positive. Anything else (a negative receptor with missing or indeterminate partners) is *unknown* and excluded.
-# * **Male patients are excluded**, because male breast cancer is biologically different and too rare (n = 12) to model.
+# Selection criteria:
+# - Retain primary tumours only (TCGA sample type 01).
+# - Retain one sample per patient.
+# - Determine HER2 status using IHC and FISH.
+# - Classify TNBC as ER-negative, PR-negative and HER2-negative.
+# - Classify non-TNBC when at least one receptor is positive.
+# - Exclude unknown receptor status.
+# - Retain female patients in the final cohort.
 
 # %%
+# ============================================================
+# 3.2 SAMPLE SELECTION AND TNBC CLASSIFICATION
+# ============================================================
+
+required_bcr_columns = [
+    "PATIENT_ID",
+    "ER_STATUS_BY_IHC",
+    "PR_STATUS_BY_IHC",
+    "IHC_HER2",
+    "HER2_FISH_STATUS"
+]
+
+missing_bcr_columns = [
+    col for col in required_bcr_columns
+    if col not in bcr.columns
+]
+
+if missing_bcr_columns:
+    raise KeyError(
+        "Missing columns in BCR clinical data: "
+        + ", ".join(missing_bcr_columns)
+    )
+
+required_gdc_columns = [
+    "PATIENT_ID",
+    "SEX",
+    "AGE",
+    "RACE"
+]
+
+missing_gdc_columns = [
+    col for col in required_gdc_columns
+    if col not in gdc_patient.columns
+]
+
+if missing_gdc_columns:
+    raise KeyError(
+        "Missing columns in GDC patient data: "
+        + ", ".join(missing_gdc_columns)
+    )
+
+
+# Standardise clinical text values.
+
+def clean_status(value):
+    if pd.isna(value):
+        return "Unknown"
+
+    value = str(value).strip().lower()
+
+    if value in ["positive", "pos", "1", "yes"]:
+        return "Positive"
+
+    if value in ["negative", "neg", "0", "no"]:
+        return "Negative"
+
+    return "Unknown"
+
+
 def her2_status(row):
-    ihc, fish = row["IHC_HER2"], row["HER2_FISH_STATUS"]
+
+    ihc = clean_status(row["IHC_HER2"])
+    fish = clean_status(row["HER2_FISH_STATUS"])
+
+    # A positive result from either test indicates HER2-positive.
     if ihc == "Positive" or fish == "Positive":
         return "Positive"
-    if fish == "Negative" or ihc == "Negative":
+
+    # If one test is negative and the other is unknown,
+    # retain the available negative result.
+    if ihc == "Negative" or fish == "Negative":
         return "Negative"
+
     return "Unknown"
+
 
 def tnbc_group(row):
-    if "Positive" in (row["ER"], row["PR"], row["HER2"]):
+
+    receptors = (
+        row["ER"],
+        row["PR"],
+        row["HER2"]
+    )
+
+    if "Positive" in receptors:
         return "non-TNBC"
-    if row["ER"] == "Negative" and row["PR"] == "Negative" and row["HER2"] == "Negative":
+
+    if all(value == "Negative" for value in receptors):
         return "TNBC"
+
     return "Unknown"
 
-clin = bcr.set_index("PATIENT_ID")
-labels = pd.DataFrame({"ER": clin["ER_STATUS_BY_IHC"], "PR": clin["PR_STATUS_BY_IHC"]})
-labels["HER2"] = clin.apply(her2_status, axis=1)
-labels["group"] = labels.apply(tnbc_group, axis=1)
-gp = gdc_patient.set_index("PATIENT_ID")
-labels = labels.join(gp[["SEX", "AGE", "RACE"]], how="left")
+
+# Prepare BCR clinical information.
+
+clin = bcr.copy()
+
+clin["PATIENT_ID"] = clin["PATIENT_ID"].astype(str).str.strip()
+clin = clin.set_index("PATIENT_ID")
+
+if clin.index.has_duplicates:
+    raise ValueError(
+        "The BCR clinical table contains duplicated patient IDs. "
+        "Resolve these before continuing."
+    )
+
+labels = pd.DataFrame(index=clin.index)
+
+labels["ER"] = clin["ER_STATUS_BY_IHC"].apply(clean_status)
+labels["PR"] = clin["PR_STATUS_BY_IHC"].apply(clean_status)
+
+labels["HER2"] = clin.apply(
+    her2_status,
+    axis=1
+)
+
+labels["group"] = labels.apply(
+    tnbc_group,
+    axis=1
+)
+
+
+# Prepare GDC demographic information.
+
+
+gp = gdc_patient.copy()
+
+gp["PATIENT_ID"] = gp["PATIENT_ID"].astype(str).str.strip()
+
+gp["SEX"] = (
+    gp["SEX"]
+    .astype("string")
+    .str.strip()
+    .str.capitalize()
+)
+
+gp = gp.set_index("PATIENT_ID")
+
+
+if gp.index.has_duplicates:
+    raise ValueError(
+        "The GDC patient table contains duplicated patient IDs."
+    )
+
+# Join demographic information to receptor information.
+labels = labels.join(
+    gp[["SEX", "AGE", "RACE"]],
+    how="left"
+)
+
+# Standardise recorded sex.
+labels["SEX"] = (
+    labels["SEX"]
+    .astype("string")
+    .str.strip()
+    .str.capitalize()
+)
+
+
+# Record cohort filtering steps.
 
 flow = []
+
+
 def log_step(step, n_samples, n_patients=None):
-    flow.append({"step": step, "samples": n_samples, "patients": n_patients if n_patients is not None else n_samples})
 
-log_step("All samples in count matrix", counts_all.shape[1], counts_all.columns.str[:12].nunique())
+    flow.append({
+        "step": step,
+        "samples": int(n_samples),
+        "patients": int(
+            n_patients if n_patients is not None else n_samples
+        )
+    })
+
+
+# All samples.
+
+all_patient_ids = counts_all.columns.str[:12]
+
+log_step(
+    "All samples in count matrix",
+    counts_all.shape[1],
+    all_patient_ids.nunique()
+)
+
+
+# Select primary tumours.
+
+if not all(
+    len(sample) >= 15
+    for sample in counts_all.columns
+):
+    raise ValueError(
+        "Some sample barcodes are too short to identify "
+        "their TCGA sample type."
+    )
+
 sample_type = counts_all.columns.str[13:15]
-print("sample-type codes:", pd.Series(sample_type).value_counts().to_dict(), "(01 = primary tumour, 06 = metastasis)")
-counts_pt = counts_all.loc[:, sample_type == "01"]
-log_step("Primary tumours (type 01)", counts_pt.shape[1], counts_pt.columns.str[:12].nunique())
-assert counts_pt.columns.str[:12].is_unique, "more than one primary tumour per patient"
-counts_pt.columns = counts_pt.columns.str[:12]          # one sample per patient -> use patient ID
 
-has_status = counts_pt.columns.intersection(labels.index)
-log_step("With receptor-status record", len(has_status))
-known = [p for p in has_status if labels.loc[p, "group"] != "Unknown"]
-log_step("TNBC status determinable", len(known))
-female = [p for p in known if labels.loc[p, "SEX"] == "Female"]
-log_step("Female patients (final cohort)", len(female))
+print(
+    "\nSample-type codes:",
+    pd.Series(sample_type).value_counts().to_dict()
+)
 
-display(pd.DataFrame(flow).set_index("step"))
-print("\nreceptor-status combinations among patients with RNA-seq:")
-display(pd.crosstab([labels.loc[has_status, "ER"], labels.loc[has_status, "PR"]], labels.loc[has_status, "HER2"]))
+counts_pt = counts_all.loc[
+    :,
+    sample_type == "01"
+].copy()
 
-# %%
+log_step(
+    "Primary tumours (type 01)",
+    counts_pt.shape[1],
+    counts_pt.columns.str[:12].nunique()
+)
+
+if counts_pt.empty:
+    raise ValueError(
+        "No primary tumour samples were found."
+    )
+
+
+# Retain one sample per patient.
+
+patient_ids = counts_pt.columns.str[:12]
+
+if patient_ids.has_duplicates:
+    duplicated_patients = (
+        patient_ids[patient_ids.duplicated()]
+        .unique()
+        .tolist()
+    )
+
+    raise ValueError(
+        "Multiple primary tumour samples were found for "
+        f"some patients: {duplicated_patients[:10]}"
+    )
+
+counts_pt.columns = patient_ids
+
+
+# Match RNA-seq samples to clinical records.
+
+has_status = counts_pt.columns.intersection(
+    labels.index
+)
+
+log_step(
+    "With receptor-status record",
+    len(has_status)
+)
+
+known = [
+    patient
+    for patient in has_status
+    if labels.loc[patient, "group"] != "Unknown"
+]
+
+log_step(
+    "TNBC status determinable",
+    len(known)
+)
+
+
+# Retain female patients.
+
+female = [
+    patient
+    for patient in known
+    if labels.loc[patient, "SEX"] == "Female"
+]
+
+log_step(
+    "Female patients (final cohort)",
+    len(female)
+)
+
+
+# Display filtering flow.
+
+print("\nCOHORT FILTERING FLOW")
+
+display(
+    pd.DataFrame(flow).set_index("step")
+)
+
+
+# Display receptor combinations.
+
+print("\nRECEPTOR-STATUS COMBINATIONS")
+
+display(
+    pd.crosstab(
+        [
+            labels.loc[has_status, "ER"],
+            labels.loc[has_status, "PR"]
+        ],
+        labels.loc[has_status, "HER2"]
+    )
+)
+
+
+# Define final cohort.
+
+if len(female) == 0:
+    raise ValueError(
+        "No female patients with known receptor status were found."
+    )
+
 cohort = labels.loc[female].copy()
-counts = counts_pt[female]
-y = (cohort["group"] == "TNBC").astype(int)
-print(cohort["group"].value_counts().to_string())
+counts = counts_pt[female].copy()
+
+y = (
+    cohort["group"] == "TNBC"
+).astype(int)
+
+print("\nFINAL COHORT COMPOSITION")
+
+display(
+    cohort["group"].value_counts().to_frame("Patients")
+)
+
+print(f"Final cohort size: {len(cohort):,}")
 print(f"TNBC fraction: {y.mean():.1%}")
+
 
 # %% [markdown]
 # ### 3.3 Library size and detected genes per sample
+#
+# Examine sequencing depth and the number of detected genes.
+# Samples with unusually small libraries are flagged for review.
+# They are not automatically removed.
 
 # %%
+# ============================================================
+# 3.3 LIBRARY SIZE AND DETECTED GENES
+# ============================================================
+
 lib_size = counts.sum(axis=0)
 detected = (counts > 0).sum(axis=0)
-log_lib = np.log10(lib_size)
-mad = stats.median_abs_deviation(log_lib)
-low_lib = log_lib < (log_lib.median() - 4 * mad)
-print(f"library size: median {lib_size.median()/1e6:.1f} M reads (range {lib_size.min()/1e6:.1f}–{lib_size.max()/1e6:.1f} M)")
-print(f"detected genes: median {detected.median():,.0f} (range {detected.min():,}–{detected.max():,})")
-print(f"samples more than 4 MADs below the median log-library size: {int(low_lib.sum())} "
-      f"(smallest library {lib_size.min()/1e6:.1f} M reads)")
-print("library size by group (M reads):")
-display((lib_size / 1e6).groupby(cohort["group"]).describe().round(1))
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for g, col in GROUP_COLORS.items():
-    axes[0].hist(lib_size[cohort["group"] == g] / 1e6, bins=40, alpha=0.6, color=col, label=g)
-axes[0].set(xlabel="library size (million reads)", ylabel="samples", title="Library size per sample")
+if (lib_size <= 0).any():
+    bad_samples = lib_size.index[
+        lib_size <= 0
+    ].tolist()
+
+    raise ValueError(
+        "Samples with zero or negative library size: "
+        f"{bad_samples[:10]}"
+    )
+
+log_lib = np.log10(lib_size.astype(float))
+
+mad = stats.median_abs_deviation(
+    log_lib,
+    scale=1
+)
+
+if mad == 0:
+    low_lib = pd.Series(False, index=log_lib.index)
+else:
+    low_lib = log_lib < (
+        log_lib.median() - 4 * mad
+    )
+
+print(
+    f"Library size: median {lib_size.median()/1e6:.1f} million reads"
+)
+
+print(
+    f"Library size range: "
+    f"{lib_size.min()/1e6:.1f}–{lib_size.max()/1e6:.1f} million reads"
+)
+
+print(
+    f"Detected genes: median {detected.median():,.0f}"
+)
+
+print(
+    f"Detected genes range: {detected.min():,}–{detected.max():,}"
+)
+
+print("Samples flagged for low library size:", int(low_lib.sum()))
+
+
+# Library size by TNBC group.
+
+print("\nLIBRARY SIZE BY GROUP (MILLION READS)")
+
+display(
+    (lib_size / 1e6)
+    .groupby(cohort["group"])
+    .describe()
+    .round(2)
+)
+
+
+# Plot library size and detected genes.
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(12, 4)
+)
+
+for group, color in GROUP_COLORS.items():
+
+    group_mask = cohort["group"] == group
+
+    axes[0].hist(
+        lib_size[group_mask] / 1e6,
+        bins=40,
+        alpha=0.6,
+        color=color,
+        label=group
+    )
+
+axes[0].set(
+    xlabel="Library size (million reads)",
+    ylabel="Samples",
+    title="Library size per sample"
+)
+
 axes[0].legend()
-axes[1].scatter(lib_size / 1e6, detected, s=8, c=cohort["group"].map(GROUP_COLORS))
-axes[1].set(xlabel="library size (million reads)", ylabel="genes with ≥1 read", title="Detected genes vs depth")
-plt.tight_layout(); plt.show()
+
+axes[1].scatter(
+    lib_size / 1e6,
+    detected,
+    s=8,
+    c=cohort["group"].map(GROUP_COLORS)
+)
+
+axes[1].set(
+    xlabel="Library size (million reads)",
+    ylabel="Genes with at least one read",
+    title="Detected genes vs sequencing depth"
+)
+
+plt.tight_layout()
+plt.show()
+
 
 # %% [markdown]
 # ### 3.4 Filtering low-expressed genes
-# A gene is kept if it has at least 1 count per million (CPM) in at least 15% of samples (≈ the size of the TNBC group). Genes below this are mostly noise and cannot be tested reliably.
+#
+# Retain a gene if it has at least 1 count per million (CPM)
+# in at least 15% of the samples.
+#
+# The CPM matrix is stored as float32 to reduce memory use.
 
 # %%
-cpm = counts / lib_size * 1e6
-keep_gene = (cpm >= 1).sum(axis=1) >= 0.15 * counts.shape[1]
-counts_f = counts.loc[keep_gene]
-print(f"genes before filter: {counts.shape[0]:,}  after: {counts_f.shape[0]:,}")
-repair_present = repair.index[repair.index.isin(counts_f.index)]
-repair_dropped = repair.index.difference(repair_present)
-print(f"DNA-repair genes kept: {len(repair_present)} of {len(repair)}; dropped (not expressed in breast tumours):",
-      ", ".join(repair.loc[repair_dropped, "symbol"]))
+# ============================================================
+# 3.4 LOW-EXPRESSION GENE FILTERING
+# ============================================================
+
+# Calculate CPM using float32 to reduce memory requirements.
+
+counts_float = counts.astype(np.float32)
+
+lib_size_float = lib_size.astype(np.float32)
+
+cpm = counts_float.div(
+    lib_size_float,
+    axis=1
+) * np.float32(1e6)
+
+baseline_threshold = 0.15
+
+minimum_samples = int(
+    np.ceil(baseline_threshold * counts.shape[1])
+)
+
+keep_gene = (
+    (cpm >= 1).sum(axis=1)
+    >= minimum_samples
+)
+
+counts_f = counts.loc[keep_gene].copy()
+
+print(f"Genes before filtering: {counts.shape[0]:,}")
+print(f"Genes after filtering: {counts_f.shape[0]:,}")
+print(f"Genes removed: {counts.shape[0] - counts_f.shape[0]:,}")
+print(f"Minimum samples required: {minimum_samples:,}")
+
+
+# Check retained DNA-repair genes.
+
+repair_ids = repair.index
+
+repair_present = repair_ids.intersection(
+    counts_f.index
+)
+
+repair_dropped = repair_ids.difference(
+    repair_present
+)
+
+print(
+    f"\nDNA-repair genes retained: "
+    f"{len(repair_present)} of {len(repair)}"
+)
+
+if len(repair_dropped) > 0:
+
+    dropped_symbols = (
+        repair.loc[repair_dropped, "symbol"]
+        .astype(str)
+        .tolist()
+    )
+
+    print(
+        "DNA-repair genes not retained:",
+        ", ".join(dropped_symbols)
+    )
+
+else:
+    print("All DNA-repair genes were retained.")
+
+
+# %% [markdown]
+# ### 3.4.1 Sensitivity analysis of gene filtering
+#
+# Compare 10%, 15% and 25% sample-prevalence thresholds.
+# The 15% threshold remains the baseline.
+
+# %%
+# ============================================================
+# 3.4.1 FILTERING SENSITIVITY ANALYSIS
+# ============================================================
+
+def calculate_filter_sensitivity(
+    cpm_matrix,
+    repair_gene_ids,
+    sample_count,
+    thresholds=(0.10, 0.15, 0.25),
+    cpm_cutoff=1
+):
+    """
+    Compare gene retention at different sample-prevalence
+    thresholds without overwriting variables used by later stages.
+    """
+
+    sensitivity_rows = []
+
+    repair_id_set = {
+        str(gene_id) for gene_id in repair_gene_ids
+    }
+
+    # Calculate the number of samples expressing each gene.
+    expressed_sample_counts = (
+        cpm_matrix.ge(cpm_cutoff).sum(axis=1)
+    )
+
+    for prevalence_threshold in thresholds:
+
+        required_sample_count = int(
+            np.ceil(prevalence_threshold * sample_count)
+        )
+
+        threshold_keep_mask = (
+            expressed_sample_counts >= required_sample_count
+        )
+
+        threshold_retained_genes = (
+            cpm_matrix.index[threshold_keep_mask]
+        )
+
+        threshold_repair_genes = sum(
+            str(gene_id) in repair_id_set
+            for gene_id in threshold_retained_genes
+        )
+
+        sensitivity_rows.append({
+            "Threshold": f"{prevalence_threshold:.0%}",
+            "Minimum samples required": required_sample_count,
+            "Total genes retained": int(threshold_keep_mask.sum()),
+            "DNA repair genes retained": int(threshold_repair_genes)
+        })
+
+    return pd.DataFrame(sensitivity_rows)
+
+
+# Run sensitivity analysis using independent function variables.
+sensitivity_df = calculate_filter_sensitivity(
+    cpm_matrix=cpm,
+    repair_gene_ids=repair.index,
+    sample_count=counts.shape[1]
+)
+
+print("GENE-FILTERING SENSITIVITY ANALYSIS")
+display(sensitivity_df)
+
+
+# Compare alternative thresholds with the 15% baseline.
+baseline_row = sensitivity_df.loc[
+    sensitivity_df["Threshold"] == "15%"
+].iloc[0]
+
+baseline_genes = int(
+    baseline_row["Total genes retained"]
+)
+
+baseline_repair = int(
+    baseline_row["DNA repair genes retained"]
+)
+
+print("\nDIFFERENCE COMPARED WITH 15% BASELINE")
+
+for _, sensitivity_row in sensitivity_df.iterrows():
+
+    print(
+        f"{sensitivity_row['Threshold']}: "
+        f"{int(sensitivity_row['Total genes retained']) - baseline_genes:+,} "
+        "total genes; "
+        f"{int(sensitivity_row['DNA repair genes retained']) - baseline_repair:+} "
+        "DNA-repair genes"
+    )
+
+
 
 # %% [markdown]
 # ### 3.5 Normalisation
-# We use DESeq2's **median-of-ratios** size factors (the same method PyDESeq2 uses in Stage 5) and then `log2(normalised count + 1)`. This removes differences in sequencing depth and compresses the range, so samples can be compared in plots, PCA and machine learning.
+#
+# Use a positive-count median-of-ratios approach.
+#
+# For each gene, calculate its geometric mean using positive
+# counts. Calculate ratios for positive observations, then
+# take the median ratio for each sample.
+#
+# Size factors are scaled to have a geometric mean of 1.
 
 # %%
+# ============================================================
+# 3.5 MEDIAN-OF-RATIOS NORMALISATION
+# ============================================================
+
 def median_of_ratios(cnt):
-    log_c = np.log(cnt.replace(0, np.nan))
-    log_geo_mean = log_c.mean(axis=1)
-    usable = log_c.notna().all(axis=1)
-    return np.exp((log_c.loc[usable].sub(log_geo_mean[usable], axis=0)).median(axis=0))
+
+    if cnt.empty:
+        raise ValueError(
+            "Cannot normalise an empty count matrix."
+        )
+
+    if (cnt < 0).to_numpy().any():
+        raise ValueError(
+            "Negative counts found during normalisation."
+        )
+
+    # Convert to float64 for numerical stability.
+    values = cnt.astype(np.float64)
+
+    # Replace zeros with NaN for geometric mean calculation.
+    log_counts = np.log(
+        values.where(values > 0)
+    )
+
+    # Calculate geometric means from positive observations.
+    log_geo_mean = log_counts.mean(
+        axis=1,
+        skipna=True
+    )
+
+    geo_means = np.exp(log_geo_mean)
+
+    usable = (
+        geo_means.notna()
+        & np.isfinite(geo_means)
+        & (geo_means > 0)
+    )
+
+    print(
+        "Genes usable for normalisation:",
+        int(usable.sum())
+    )
+
+    if not usable.any():
+        raise ValueError(
+            "No genes are usable for median-of-ratios normalisation."
+        )
+
+    # Calculate ratios only where counts are positive.
+    ratios = (
+        values.loc[usable]
+        .where(values.loc[usable] > 0)
+        .div(geo_means.loc[usable], axis=0)
+    )
+
+    ratios = ratios.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    # Calculate the median ratio for each sample.
+    factors = ratios.median(
+        axis=0,
+        skipna=True
+    )
+
+    if factors.isna().any():
+        bad = factors.index[
+            factors.isna()
+        ].tolist()
+
+        raise ValueError(
+            "Size factors could not be calculated for samples: "
+            f"{bad[:10]}"
+        )
+
+    if (factors <= 0).any():
+        raise ValueError(
+            "Non-positive size factors were calculated."
+        )
+
+    # Scale factors to geometric mean 1.
+    factors = factors / np.exp(
+        np.log(factors).mean()
+    )
+
+    return factors
+
+
+# Calculate size factors using the filtered count matrix.
 
 size_factors = median_of_ratios(counts_f)
-logn = np.log2(counts_f / size_factors + 1)            # genes x samples
-print(f"size factors: median {size_factors.median():.2f}, range {size_factors.min():.2f}–{size_factors.max():.2f}")
-print("correlation of size factor with library size:", round(np.corrcoef(size_factors, lib_size)[0, 1], 3))
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+# Normalise the 15%-filtered count matrix, not the unfiltered matrix.
+normalised_counts = counts_f.astype(np.float64).div(
+    size_factors, axis=1
+)
+
+logn = np.log2(normalised_counts + 1)
+
+
+# Confirm that filtered counts and normalised expression
+# contain exactly the same genes and samples.
+
+assert counts_f.index.equals(logn.index), (
+    "Gene mismatch: counts_f and logn have different gene indexes."
+)
+
+assert counts_f.columns.equals(logn.columns), (
+    "Sample mismatch: counts_f and logn have different sample columns."
+)
+
+assert counts_f.shape == logn.shape, (
+    "Shape mismatch between filtered counts and log-normalised counts."
+)
+
+print("\nNormalisation alignment check passed.")
+print("Filtered counts shape:", counts_f.shape)
+print("Log-normalised expression shape:", logn.shape)
+
+
+sf_lib_correlation = np.corrcoef(
+    size_factors.to_numpy(),
+    lib_size.to_numpy()
+)[0, 1]
+
+print(
+    f"\nMedian size factor: {size_factors.median():.3f}"
+)
+
+print(
+    f"Size factor range: "
+    f"{size_factors.min():.3f}–{size_factors.max():.3f}"
+)
+
+print(
+    "Correlation of size factors with library size:",
+    round(sf_lib_correlation, 3)
+)
+
+
+# Plot expression distributions before and after normalisation.
+# Use a sample of genes to reduce plotting memory requirements.
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(12, 4)
+)
+
 rng = np.random.default_rng(SEED)
-for s in rng.choice(logn.columns, 60, replace=False):
-    sns.kdeplot(np.log2(counts_f[s] + 1), ax=axes[0], lw=0.6, color="grey", alpha=0.5)
-    sns.kdeplot(logn[s], ax=axes[1], lw=0.6, color="teal", alpha=0.5)
-axes[0].set(title="Before normalisation: log2(count+1)", xlabel="log2 expression")
-axes[1].set(title="After median-of-ratios normalisation", xlabel="log2 normalised expression")
-plt.tight_layout(); plt.show()
+
+number_to_plot = min(
+    30,
+    len(logn.columns)
+)
+
+selected_samples = rng.choice(
+    logn.columns.to_numpy(),
+    number_to_plot,
+    replace=False
+)
+
+for sample in selected_samples:
+
+    sns.kdeplot(
+        np.log2(counts[sample].to_numpy(dtype=np.float32) + 1),
+        ax=axes[0],
+        lw=0.6,
+        color="grey",
+        alpha=0.5
+    )
+
+    sns.kdeplot(
+        logn[sample].to_numpy(dtype=np.float32),
+        ax=axes[1],
+        lw=0.6,
+        color="teal",
+        alpha=0.5
+    )
+
+axes[0].set(
+    title="Before normalisation",
+    xlabel="log2(count + 1)"
+)
+
+axes[1].set(
+    title="After median-of-ratios normalisation",
+    xlabel="log2(normalised count + 1)"
+)
+
+plt.tight_layout()
+plt.show()
+
 
 # %% [markdown]
 # ### 3.6 Biological sanity checks
-# Some biology must hold if the labels and expression data are matched correctly:
 #
-# * *ESR1* mRNA should be much lower in ER-negative tumours, *PGR* lower in PR-negative tumours, and *ERBB2* higher in HER2-positive tumours.
-# * Y-chromosome genes (*RPS4Y1, DDX3Y, KDM5D*) should be essentially silent in female patients. The 12 male patients excluded above serve as a positive control.
+# Examine whether gene expression agrees with clinical labels.
+#
+# Expected relationships:
+# - ESR1 expression should generally be higher in ER-positive tumours.
+# - PGR expression should generally be higher in PR-positive tumours.
+# - ERBB2 expression should generally be higher in HER2-positive tumours.
+# - Y-chromosome genes should generally be higher in male samples.
 
 # %%
+# ============================================================
+# 3.6 BIOLOGICAL SANITY CHECKS
+# ============================================================
+
+# Build a gene-symbol-to-Entrez-ID dictionary.
+
+symbol_to_id = {}
+
+symbol_to_id.update(MARKERS)
+symbol_to_id.update(PROLIF)
+
+repair_mapping = {
+    str(symbol): entrez_id
+    for entrez_id, symbol in repair["symbol"].items()
+    if pd.notna(symbol)
+}
+
+symbol_to_id.update(repair_mapping)
+
+
+# Map string gene IDs to their actual index values.
+# This handles cases where one table uses strings and
+# another uses integers for Entrez Gene IDs.
+
+index_lookup = {
+    str(gene_id): gene_id
+    for gene_id in logn.index
+}
+
+
+def resolve_gene_id(symbol_or_id):
+
+    if symbol_or_id in symbol_to_id:
+        gene_id = symbol_to_id[symbol_or_id]
+    else:
+        gene_id = symbol_or_id
+
+    return index_lookup.get(
+        str(gene_id),
+        None
+    )
+
+
 def gene(sym_or_id):
-    eid = sym_or_id if isinstance(sym_or_id, (int, np.integer)) else {**MARKERS, **PROLIF,
-           **{v: k for k, v in repair["symbol"].items()}}[sym_or_id]
-    return logn.loc[eid] if eid in logn.index else np.log2(counts.loc[eid] / size_factors + 1)
 
-checks = [("ESR1", "ER"), ("PGR", "PR"), ("ERBB2", "HER2")]
-fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    gene_id = resolve_gene_id(sym_or_id)
+
+    if gene_id is None:
+        raise KeyError(
+            f"Gene {sym_or_id!r} was not found in the expression matrix."
+        )
+
+    return logn.loc[gene_id]
+
+
+# Compare receptor-associated gene expression.
+
+checks = [
+    ("ESR1", "ER"),
+    ("PGR", "PR"),
+    ("ERBB2", "HER2")
+]
+
+fig, axes = plt.subplots(
+    1,
+    4,
+    figsize=(16, 4)
+)
+
 rows = []
-for ax, (sym, receptor) in zip(axes, checks):
-    status = cohort[receptor].where(cohort[receptor].isin(["Positive", "Negative"]))
-    df = pd.DataFrame({"expr": gene(sym), "status": status}).dropna()
-    sns.boxplot(data=df, x="status", y="expr", order=["Negative", "Positive"], ax=ax, fliersize=1,
-                palette={"Negative": "#AAB7B8", "Positive": "#F5B041"})
-    auc = stats.mannwhitneyu(df.expr[df.status == "Positive"], df.expr[df.status == "Negative"]).statistic / (
-        (df.status == "Positive").sum() * (df.status == "Negative").sum())
-    rows.append({"gene": sym, "receptor": receptor, "AUC (expr separates status)": round(auc, 3),
-                 "median log2 expr in negative": round(df.expr[df.status == "Negative"].median(), 2),
-                 "median log2 expr in positive": round(df.expr[df.status == "Positive"].median(), 2)})
-    ax.set(title=f"{sym} by {receptor} status", xlabel=f"{receptor} (clinical)", ylabel="log2 normalised expression")
-# Sex check on all primary tumours: the 12 male patients (excluded above) act as a positive control
-cpm_pt = counts_pt / counts_pt.sum(axis=0) * 1e6
-y_score = np.log2(cpm_pt.loc[[MARKERS[g] for g in ["RPS4Y1", "DDX3Y", "KDM5D"]]] + 1).mean(axis=0)
-sex_df = pd.DataFrame({"Y-gene score": y_score, "sex": gp["SEX"].reindex(counts_pt.columns)}).dropna()
-sns.boxplot(data=sex_df, x="sex", y="Y-gene score", order=["Female", "Male"], ax=axes[3], fliersize=0,
-            palette={"Female": "#D7BDE2", "Male": "#A9CCE3"})
-sns.stripplot(data=sex_df, x="sex", y="Y-gene score", order=["Female", "Male"], ax=axes[3], size=2, color="k", alpha=0.4)
-axes[3].set(title="Y-chromosome genes (RPS4Y1, DDX3Y, KDM5D)", ylabel="mean log2(CPM + 1)", xlabel="recorded sex")
-plt.tight_layout(); plt.show()
-display(pd.DataFrame(rows))
 
-male_min = sex_df.loc[sex_df.sex == "Male", "Y-gene score"].min()
-fem_max = sex_df.loc[sex_df.sex == "Female", "Y-gene score"].max()
-print(f"Y-gene score: highest female {fem_max:.2f} vs lowest male {male_min:.2f}; "
-      f"female samples in the male range: {int((sex_df.loc[sex_df.sex == 'Female', 'Y-gene score'] >= male_min).sum())}")
+for ax, (symbol, receptor) in zip(axes, checks):
 
-# Suspicious labels: ER-negative by IHC but ESR1 mRNA at a typical ER-positive level
-esr1 = gene("ESR1")
-er_pos_q10 = esr1[cohort["ER"] == "Positive"].quantile(0.10)
-discordant = cohort.index[(cohort["group"] == "TNBC") & (esr1 > er_pos_q10)]
-print(f"TNBC tumours with ESR1 above the 10th percentile of ER-positive tumours: {len(discordant)} "
-      f"of {int(y.sum())} ({len(discordant)/y.sum():.1%})")
+    try:
+        expression = gene(symbol)
+
+    except KeyError as error:
+        print("Warning:", error)
+        ax.set_visible(False)
+        continue
+
+    status = cohort[receptor].where(
+        cohort[receptor].isin(["Positive", "Negative"])
+    )
+
+    df = pd.DataFrame({
+        "expression": expression,
+        "status": status
+    }).dropna()
+
+    positive = df.loc[
+        df["status"] == "Positive",
+        "expression"
+    ]
+
+    negative = df.loc[
+        df["status"] == "Negative",
+        "expression"
+    ]
+
+    if positive.empty or negative.empty:
+        print(
+            f"Warning: cannot compare {symbol}; "
+            "one receptor-status group is empty."
+        )
+        ax.set_visible(False)
+        continue
+
+    sns.boxplot(
+        data=df,
+        x="status",
+        y="expression",
+        order=["Negative", "Positive"],
+        ax=ax,
+        fliersize=1
+    )
+
+    # AUC based on the Mann-Whitney U statistic.
+    auc = stats.mannwhitneyu(
+        positive,
+        negative,
+        alternative="two-sided"
+    ).statistic / (
+        len(positive) * len(negative)
+    )
+
+    rows.append({
+        "gene": symbol,
+        "receptor": receptor,
+        "AUC": round(auc, 3),
+        "median negative": round(negative.median(), 2),
+        "median positive": round(positive.median(), 2)
+    })
+
+    ax.set(
+        title=f"{symbol} by {receptor} status",
+        xlabel="Clinical receptor status",
+        ylabel="log2 normalised expression"
+    )
+
+
+# Y-chromosome gene check.
+
+y_gene_symbols = [
+    "RPS4Y1",
+    "DDX3Y",
+    "KDM5D"
+]
+
+available_y_genes = [
+    symbol
+    for symbol in y_gene_symbols
+    if resolve_gene_id(symbol) is not None
+]
+
+if len(available_y_genes) == 0:
+
+    axes[3].set_visible(False)
+
+    print(
+        "Warning: no Y-chromosome genes were found "
+        "in MARKERS, PROLIF or repair."
+    )
+
+else:
+
+    y_gene_ids = [
+        resolve_gene_id(symbol)
+        for symbol in available_y_genes
+    ]
+
+    missing_y_genes = [
+        symbol
+        for symbol in available_y_genes
+        if resolve_gene_id(symbol) not in counts_pt.index
+    ]
+
+    available_y_genes = [
+        symbol
+        for symbol in available_y_genes
+        if resolve_gene_id(symbol) in counts_pt.index
+    ]
+
+    y_gene_ids = [
+        resolve_gene_id(symbol)
+        for symbol in available_y_genes
+    ]
+
+    if len(y_gene_ids) == 0:
+
+        axes[3].set_visible(False)
+
+        print(
+            "Warning: Y-chromosome genes were not present "
+            "in the primary tumour count matrix."
+        )
+
+    else:
+
+        # Calculate CPM for the primary tumour samples.
+        primary_lib_size = counts_pt.sum(axis=0).astype(np.float64)
+
+        cpm_pt = (
+            counts_pt.astype(np.float32)
+            .div(primary_lib_size.astype(np.float32), axis=1)
+            * np.float32(1e6)
+        )
+
+        y_score = np.log2(
+            cpm_pt.loc[y_gene_ids].astype(np.float32) + 1
+        ).mean(axis=0)
+
+        sex_df = pd.DataFrame({
+            "Y-gene score": y_score,
+            "sex": gp["SEX"].reindex(counts_pt.columns)
+        }).dropna()
+
+        if (
+            (sex_df["sex"] == "Female").any()
+            and (sex_df["sex"] == "Male").any()
+        ):
+
+            sns.boxplot(
+                data=sex_df,
+                x="sex",
+                y="Y-gene score",
+                order=["Female", "Male"],
+                ax=axes[3],
+                fliersize=0
+            )
+
+            sns.stripplot(
+                data=sex_df,
+                x="sex",
+                y="Y-gene score",
+                order=["Female", "Male"],
+                ax=axes[3],
+                size=2,
+                color="black",
+                alpha=0.4
+            )
+
+            axes[3].set(
+                title="Y-chromosome gene expression",
+                ylabel="Mean log2(CPM + 1)",
+                xlabel="Recorded sex"
+            )
+
+        else:
+
+            axes[3].set_visible(False)
+
+            print(
+                "Warning: male and female primary tumour samples "
+                "are both required for the Y-gene comparison."
+            )
+
+
+plt.tight_layout()
+plt.show()
+
+
+print("\nRECEPTOR-EXPRESSION CHECKS")
+
+if rows:
+    display(pd.DataFrame(rows))
+else:
+    print("No receptor-expression comparisons were completed.")
+
+
+# Compare male and female Y-gene scores.
+
+if "sex_df" in globals():
+
+    male_scores = sex_df.loc[
+        sex_df["sex"] == "Male",
+        "Y-gene score"
+    ]
+
+    female_scores = sex_df.loc[
+        sex_df["sex"] == "Female",
+        "Y-gene score"
+    ]
+
+    if male_scores.empty or female_scores.empty:
+
+        print(
+            "Male or female samples are missing "
+            "from the Y-gene comparison."
+        )
+
+    else:
+
+        male_min = male_scores.min()
+        female_max = female_scores.max()
+
+        print(
+            f"Highest female Y-gene score: {female_max:.2f}"
+        )
+
+        print(
+            f"Lowest male Y-gene score: {male_min:.2f}"
+        )
+
+        print(
+            "Female samples in the male score range:",
+            int((female_scores >= male_min).sum())
+        )
+
 
 # %% [markdown]
-# **Interpretation (Stage 3).** 
+# ### 3.6.1 Investigation of ESR1-discordant TNBC tumours
 #
-# * **Integrity:** no missing, negative or non-integer values, as expected for raw counts. 34 Entrez IDs appeared on two rows (genes annotated twice in GENCODE); we summed them, giving 40,761 unique genes.
-# * **Cohort:** 1,097 samples → 1,090 primary tumours (7 metastases removed) → 1,089 with a receptor record → 1,018 with a determinable TNBC status (71 with incomplete or indeterminate receptors excluded) → **1,006 female patients: 157 TNBC (15.6%) and 849 non-TNBC**. The 15.6% TNBC share matches the 15–20% usually reported, a first sign that the labels are sensible. The classes are imbalanced (about 1 : 5), which matters for Stage 7.
-# * **Sequencing depth:** median 57.5 M reads per tumour, almost the same in TNBC (59.4 M) and non-TNBC (57.1 M), so depth cannot explain group differences. 16 samples have small libraries for this cohort, but even the smallest has 19.2 M reads, plenty for gene-level counts. We kept them and let normalisation correct for depth.
-# * **Filtering:** 16,697 genes pass the filter, and 148 of the 156 repair genes are expressed. Some exclusions are biological: *DNTT* is only active in developing lymphocytes. Others are technical. *SLX1A/SLX1B* are duplicated copies of each other, so their reads cannot be placed uniquely. **Suspicious:** *GTF2H4* and *TOP3B* are housekeeping genes expressed in essentially every cell, yet they have a median of only ~4 reads per tumour. This is most likely a gene-annotation or read-assignment artefact (reads that overlap more than one annotated gene are discarded by gene-level counting), not true absence. We note it as a limitation rather than force them back in.
-# * **Normalisation:** size factors (0.28–2.10) track library size (r = 0.93), and the per-sample expression distributions line up after normalisation.
-# * **Biology checks pass:** *ESR1* separates ER-positive from ER-negative tumours almost perfectly (AUC 0.97; median log2 14.9 vs 8.4, about 90-fold), and *PGR* separates PR status (AUC 0.93). *ERBB2* separates HER2 status less sharply (AUC 0.81). That is expected: clinical HER2 positivity is defined by gene amplification or protein level, and equivocal cases sit in between. Every female sample's Y-gene score (maximum 2.3) is below every male sample's (minimum 5.0), so recorded sex agrees with the data.
-# * **Suspicious labels:** 5 of 157 TNBC tumours (3.2%) express *ESR1* at a level typical of ER-positive tumours. They may be IHC false negatives or ER-low tumours. We keep them, because dropping samples on the basis of expression would bias the comparison, and we list label noise as a limitation.
+# Identify TNBC tumours whose ESR1 expression is above
+# the 10th percentile of ER-positive tumours.
+#
+# These samples are flagged for review. They are not
+# automatically removed or reclassified.
+
+# %%
+# ============================================================
+# 3.6.1 ESR1-DISCORDANT TNBC INVESTIGATION
+# ============================================================
+
+esr1 = gene("ESR1")
+pgr = gene("PGR")
+
+er_positive = cohort["ER"] == "Positive"
+
+if not er_positive.any():
+    raise ValueError(
+        "No ER-positive tumours are available to calculate "
+        "the ESR1 reference percentile."
+    )
+
+er_pos_q10 = esr1.loc[
+    er_positive
+].quantile(0.10)
+
+discordant = cohort.index[
+    (cohort["group"] == "TNBC")
+    & (esr1 > er_pos_q10)
+]
+
+tnbc_count = int(y.sum())
+
+discordant_fraction = (
+    len(discordant) / tnbc_count
+    if tnbc_count > 0
+    else 0
+)
+
+print(
+    "TNBC tumours with ESR1 above the 10th percentile "
+    "of ER-positive tumours:"
+)
+
+print(
+    f"{len(discordant)} of {tnbc_count} "
+    f"({discordant_fraction:.1%})"
+)
+
+
+# Expression and assigned receptor labels.
+
+esr1_qc = pd.DataFrame({
+    "ESR1 expression": esr1.reindex(discordant),
+    "PGR expression": pgr.reindex(discordant),
+    "ER status used": cohort.loc[discordant, "ER"],
+    "PR status used": cohort.loc[discordant, "PR"],
+    "HER2 status used": cohort.loc[discordant, "HER2"]
+})
+
+
+# Original clinical receptor records.
+
+clinical_records = clin.reindex(discordant)[[
+    "ER_STATUS_BY_IHC",
+    "PR_STATUS_BY_IHC",
+    "IHC_HER2",
+    "HER2_FISH_STATUS"
+]].rename(columns={
+    "ER_STATUS_BY_IHC": "Original ER IHC record",
+    "PR_STATUS_BY_IHC": "Original PR IHC record",
+    "IHC_HER2": "Original HER2 IHC record",
+    "HER2_FISH_STATUS": "Original HER2 FISH record"
+})
+
+esr1_qc = esr1_qc.join(
+    clinical_records
+)
+
+esr1_qc.index.name = "Patient ID"
+
+print("\nESR1-DISCORDANT TNBC CASES")
+
+if esr1_qc.empty:
+    print("No ESR1-discordant TNBC cases were identified.")
+else:
+    display(esr1_qc.round(3))
+
+
+# %% [markdown]
+# ## Interpretation (Stage 3)
+#
+# This section interprets the preprocessing and quality-control
+# results, including filtering sensitivity, DNA-repair gene retention,
+# biological sanity checks and ESR1-discordant TNBC cases.
+
+# %%
+# ============================================================
+# 3.6.2 INTERPRETATION OF PREPROCESSING AND QUALITY CONTROL
+# ============================================================
+
+print("INTERPRETATION OF STAGE 3 RESULTS")
+print("=" * 60)
+
+
+# 1. Filtering sensitivity.
+
+print("\n1. GENE-FILTERING SENSITIVITY")
+
+display(sensitivity_df)
+
+print(
+    "The 10%, 15% and 25% thresholds were compared to assess "
+    "how filtering stringency affects the number of retained "
+    "genes and DNA-repair genes."
+)
+
+print(
+    f"The selected 15% threshold retained {baseline_genes:,} genes, "
+    f"including {baseline_repair:,} DNA-repair genes."
+)
+
+print(
+    "The 10% threshold is less stringent and may retain additional "
+    "low-expression genes. The 25% threshold is more stringent "
+    "and may remove genes expressed in fewer samples."
+)
+
+
+# 2. DNA-repair gene retention.
+
+print("\n2. DNA-REPAIR GENE RETENTION")
+
+print(
+    f"{len(repair_present):,} of {len(repair):,} "
+    "DNA-repair genes were retained at the 15% threshold."
+)
+
+if len(repair_dropped) > 0:
+    print(
+        "Some DNA-repair genes were removed because they did not "
+        "meet the selected expression-prevalence requirement."
+    )
+else:
+    print(
+        "All genes in the supplied DNA-repair gene set were retained."
+    )
+
+
+# 3. Normalisation.
+
+print("\n3. NORMALISATION")
+
+print(
+    "Median-of-ratios size factors were calculated using the "
+    "15%-filtered count matrix."
+)
+
+print(
+    "The normalised expression matrix contains the same genes "
+    "as the filtered count matrix."
+)
+
+print(
+    f"Normalised expression matrix dimensions: "
+    f"{logn.shape[0]:,} genes x {logn.shape[1]:,} samples."
+)
+
+
+# 4. Biological sanity checks.
+
+print("\n4. BIOLOGICAL SANITY CHECKS")
+
+if rows:
+
+    receptor_results = pd.DataFrame(rows)
+    display(receptor_results)
+
+    for _, receptor_row in receptor_results.iterrows():
+
+        print(
+            f"{receptor_row['gene']}: "
+            f"median negative = {receptor_row['median negative']}, "
+            f"median positive = {receptor_row['median positive']}, "
+            f"AUC = {receptor_row['AUC']}."
+        )
+
+else:
+
+    print(
+        "No receptor-expression comparisons were completed. "
+        "Gene availability and receptor group sizes should be reviewed."
+    )
+
+
+# 5. ESR1-discordant TNBC cases.
+
+print("\n5. ESR1-DISCORDANT TNBC CASES")
+
+print(
+    f"{len(discordant):,} of {tnbc_count:,} TNBC cases "
+    f"({discordant_fraction:.1%}) were identified as ESR1-discordant."
+)
+
+if len(discordant) > 0:
+
+    print(
+        "These cases have ESR1 expression above the 10th percentile "
+        "of the ER-positive reference group, despite being classified "
+        "as TNBC using their clinical receptor records."
+    )
+
+    print(
+        "The cases are retained in the cohort and flagged for "
+        "further review. They are not automatically reclassified "
+        "as non-TNBC because gene expression alone does not override "
+        "the clinical receptor classification."
+    )
+
+    display(esr1_qc.round(3))
+
+else:
+
+    print(
+        "No ESR1-discordant TNBC cases were identified using "
+        "the selected reference threshold."
+    )
+
+
+# 6. Overall interpretation.
+
+print("\n6. OVERALL INTERPRETATION")
+
+print(
+    "Stage 3 produced a quality-controlled primary tumour cohort, "
+    "applied a 15% expression-prevalence filter, and normalised "
+    "the filtered gene-expression matrix."
+)
+
+print(
+    "The sensitivity analysis documents how alternative filtering "
+    "thresholds affect total gene and DNA-repair gene retention."
+)
+
+print(
+    "The ESR1-discordant cases are retained and flagged for "
+    "clinical review rather than being automatically excluded "
+    "or reclassified."
+)
+
+print(
+    "The filtered and normalised expression matrix is passed "
+    "to the downstream analysis stages."
+)
+
+
+
+# %% [markdown]
+# ### 3.7 Stage 3 summary
+#
+# Summarise the actual outputs generated during preprocessing
+# and quality control.
+
+# %%
+# ============================================================
+# 3.7 STAGE 3 SUMMARY
+# ============================================================
+
+print("STAGE 3 SUMMARY")
+print("=" * 50)
+
+
+# 1. Integrity.
+
+print("\n1. COUNT MATRIX INTEGRITY")
+
+print("Missing values:", missing_values)
+print("Negative counts:", negative_counts)
+print("Non-integer counts:", non_integer_counts)
+print("Duplicated gene IDs in original matrix:", duplicate_gene_ids)
+
+print(
+    "Unique genes after merging:",
+    f"{counts_all.shape[0]:,}"
+)
+
+
+# 2. Cohort.
+
+print("\n2. COHORT SELECTION")
+
+display(
+    pd.DataFrame(flow).set_index("step")
+)
+
+print("\nFinal group composition:")
+
+display(
+    cohort["group"].value_counts().to_frame("Patients")
+)
+
+print(f"Final cohort: {len(cohort):,} patients")
+
+print(
+    f"TNBC: {int(y.sum()):,} ({y.mean():.1%})"
+)
+
+print(
+    f"non-TNBC: {int((y == 0).sum()):,} "
+    f"({(y == 0).mean():.1%})"
+)
+
+
+# 3. Sequencing depth.
+
+print("\n3. SEQUENCING DEPTH")
+
+print(
+    f"Median library size: "
+    f"{lib_size.median()/1e6:.2f} million reads"
+)
+
+print(
+    "Low-library samples flagged:",
+    int(low_lib.sum())
+)
+
+print(
+    f"Median detected genes: {detected.median():,.0f}"
+)
+
+
+# 4. Gene filtering.
+
+print("\n4. GENE FILTERING")
+
+print(f"Genes before filtering: {counts.shape[0]:,}")
+print(f"Genes after 15% filtering: {counts_f.shape[0]:,}")
+
+display(sensitivity_df)
+
+print(
+    f"DNA-repair genes retained: "
+    f"{len(repair_present)} of {len(repair)}"
+)
+
+
+# 5. Normalisation.
+
+print("\n5. NORMALISATION")
+
+print(
+    f"Median size factor: {size_factors.median():.3f}"
+)
+
+print(
+    f"Size factor range: "
+    f"{size_factors.min():.3f}–{size_factors.max():.3f}"
+)
+
+print(
+    "Correlation with library size:",
+    round(sf_lib_correlation, 3)
+)
+
+
+# 6. Biological checks.
+
+print("\n6. BIOLOGICAL SANITY CHECKS")
+
+if rows:
+    display(pd.DataFrame(rows))
+else:
+    print("No receptor-expression comparisons were completed.")
+
+
+# 7. ESR1-discordant cases.
+
+print("\n7. ESR1-DISCORDANT TNBC CASES")
+
+print(
+    f"{len(discordant)} of {tnbc_count} TNBC tumours "
+    f"({discordant_fraction:.1%})"
+)
+
+print(
+    "These cases should be reviewed using their "
+    "clinical receptor records."
+)
+
+print(
+    "Do not remove or reclassify samples based on expression alone."
+)
+
+
+# Final output variables available to later stages.
+
+print("\n8. OUTPUTS AVAILABLE FOR LATER STAGES")
+
+stage3_outputs = [
+    "counts_all",
+    "counts_pt",
+    "counts",
+    "counts_f",
+    "cohort",
+    "y",
+    "cpm",
+    "size_factors",
+    "normalised_counts",
+    "logn",
+    "sensitivity_df",
+    "esr1_qc",
+    "discordant"
+]
+
+for output in stage3_outputs:
+    print(" -", output)
+
+
+# Final consistency checks for downstream stages.
+
+assert counts_f.shape == logn.shape
+assert counts_f.index.equals(logn.index)
+assert counts_f.columns.equals(logn.columns)
+
+assert len(cohort) == counts.shape[1]
+assert len(y) == counts.shape[1]
+
+print("\nFINAL DOWNSTREAM DATA CHECKS PASSED")
+print("Filtered genes:", f"{counts_f.shape[0]:,}")
+print("Samples:", f"{counts_f.shape[1]:,}")
+print("Normalised genes:", f"{logn.shape[0]:,}")
+
+print("\nStage 3 preprocessing and quality control completed.")
