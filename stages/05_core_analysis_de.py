@@ -226,6 +226,7 @@ print(f"two extra DESeq2 fits finished in {time.time()-t0:.0f}s")
 
 # Age effect itself (natural-log LFC per SD of age -> log2 per 10 years)
 age_lfc = dds_age.varm["LFC"]["AGE"] / np.log(2) / age[has_age].std() * 10
+age_lfc.index = age_lfc.index.astype(int)            # DESeq2 stores gene IDs as text
 print(f"median |age effect| on repair genes: {age_lfc.reindex(counts_f.index).loc[repair_present].abs().median():.3f} "
       f"log2 per 10 years (TNBC effect: {rep.log2FoldChange.abs().median():.3f})")
 
@@ -257,8 +258,9 @@ print(f"significant (repair-family FDR < 0.05): {int(sig0.sum())} originally, {i
 print(f"up / down after age adjustment: {int((sig1 & (cmp_age.lfc_age_adjusted > 0)).sum())} / "
       f"{int((sig1 & (cmp_age.lfc_age_adjusted < 0)).sum())} (originally {int((sig0 & (rep.log2FoldChange > 0)).sum())} / "
       f"{int((sig0 & (rep.log2FoldChange < 0)).sum())})")
-print("≥2-fold calls, original:", ", ".join(cmp_age.symbol[cmp_age.call_original.str.contains("2x")]))
-print("≥2-fold calls, age-adjusted:", ", ".join(cmp_age.symbol[cmp_age.call_age_adjusted.str.contains("2x")]))
+TWOFOLD = ["UP ≥2x in TNBC", "DOWN ≥2x in TNBC"]
+print("≥2-fold calls, original:", ", ".join(cmp_age.symbol[cmp_age.call_original.isin(TWOFOLD)]))
+print("≥2-fold calls, age-adjusted:", ", ".join(cmp_age.symbol[cmp_age.call_age_adjusted.isin(TWOFOLD)]))
 changed = cmp_age[cmp_age.call_original != cmp_age.call_age_adjusted]
 print(f"\n{len(changed)} repair genes change their call after age adjustment:")
 display(changed[["symbol", "lfc_original", "lfc_age_adjusted", "call_original", "call_age_adjusted"]].round(3))
@@ -311,7 +313,7 @@ print(f"Repair genes, raw vs shrunken log2FC: Pearson r = {stats.pearsonr(rep_sh
       f"({rep_shr.loc[rep_shr.shrink.abs().idxmax(), 'symbol']})")
 print(f"genes with |shrunken log2FC| ≥ 1 and repair-family FDR < 0.05: "
       f"{int(((rep_shr.log2FC_shrunk.abs() >= 1) & (rep_shr.padj_repair_family < 0.05)).sum())} "
-      f"(raw: {int(rep_shr.call.str.contains('2x').sum())})")
+      f"(raw: {int(rep_shr.call.isin(TWOFOLD).sum())})")
 print("\nRepair genes ranked by shrunken log2FC (top 12 up, top 5 down):")
 rep_shr = rep_shr.sort_values("log2FC_shrunk", ascending=False)
 display(rep_shr.head(12).round(3))
@@ -333,3 +335,5 @@ rep_shr.to_csv(os.path.join(RESULTS_DIR, "dna_repair_DE_shrunken.csv"))
 #   * **Lower** than proliferation predicts (67 genes): led by ***BRCA1*** (−0.84 log2), then *POLN, POLD4, RAD50, EME2, ATRIP, MSH3*.
 #
 #   The adjusted estimate is the part of the TNBC difference that proliferation cannot explain. It is not the "true" effect: if TNBC biology drives both proliferation and repair expression, adjustment removes some real signal too.
+# * **Age (robustness check):** TNBC patients are younger, so we re-ran DESeq2 with age as a covariate (`~AGE + group`) on the 992 patients with a recorded age (14 dropped; 157 TNBC, 835 non-TNBC). The repair-gene fold changes are practically identical to the original ones (Pearson r = 1.000, Spearman ρ = 0.999). The median change is 0.009 log2 units and the largest is 0.072 (*NTHL1*, a gene with almost no TNBC effect). 115 instead of 116 repair genes stay significant (79 up, 36 down). Only *RAD51C* changes its call, from slightly down (log2FC −0.16) to not significant (−0.14). The same eleven genes change at least two-fold. Fitting `~group` on the same 992 patients gives the same fold changes too (r = 1.000), so neither dropping the patients without age nor adjusting for age changes anything. **The TNBC repair-gene differences are not an age effect.** The model only adjusts for a linear age trend, which is the usual assumption.
+# * **Shrunken fold changes:** apeGLM shrinkage hardly moves any repair-gene estimate (r = 1.0000 with the raw values; median shift 0.002, largest 0.012 for *POLN*). The ranking and the eleven ≥2-fold genes stay the same, led by *FANCA* (1.37), *RAD54L* (1.36) and *CHEK1* (1.28), with *POLN* (−1.14) the only one down. This is expected: with ~1,000 tumours and well-expressed genes the standard errors are small (lfcSE 0.06–0.10), so the prior has little to correct. The raw fold changes reported above can be trusted as effect sizes.

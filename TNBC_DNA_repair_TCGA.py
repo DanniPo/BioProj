@@ -292,7 +292,7 @@ except Exception as err:
     print(f"GDC API not reachable from this machine ({type(err).__name__}); provenance check skipped.")
 
 # %% [markdown]
-# **Interpretation (Stage 2).** All four files downloaded and matched their pinned SHA-256 hashes, so these are exactly the inputs we analysed. The expression matrix covers **40,796 genes in 1,097 TCGA-BRCA tumour samples** and contains all 156 DNA-repair genes. The receptor-status table covers 1,097 patients. So the data can answer our question: it holds both the grouping variable (ER/PR/HER2) and genome-wide expression for the same patients. One weakness is visible already. Receptor status was scored by pathologists at many hospitals over several years, so some label noise is expected; we check this in Stage 3. When run in Colab, the GDC check above prints how many of our patients appear in GDC's own STAR-Counts listing. That confirms the mirror really carries GDC data.
+# **Interpretation (Stage 2).** All four files downloaded and matched their pinned SHA-256 hashes, so these are exactly the inputs we analysed. The expression matrix covers **40,796 genes in 1,097 TCGA-BRCA tumour samples** and contains all 156 DNA-repair genes. The receptor-status table covers 1,097 patients. So the data can answer our question: it holds both the grouping variable (ER/PR/HER2) and genome-wide expression for the same patients. One weakness is visible already. Receptor status was scored by pathologists at many hospitals over several years, so some label noise is expected; we check this in Stage 3. When run in Colab, the GDC check listed 1,111 primary-tumour STAR-count files for 1,095 TCGA-BRCA patients, and all 1,090 distinct patients in our matrix (1,097 sample columns) were in that listing. That confirms the mirror really carries GDC data; five GDC patients are not in our matrix.
 
 # %% [markdown]
 # ## Stage 3 · Preprocessing and quality control
@@ -577,12 +577,34 @@ cg.fig.legend(handles=handles, loc="lower center", ncol=9, bbox_to_anchor=(0.55,
 cg.fig.suptitle("DNA-repair gene expression across 1,006 tumours (rows and columns clustered)", y=1.01)
 plt.show()
 
+# %%
+# Which genes drive PC1 of the repair-gene PCA? PC1 is the proliferation axis (see above),
+# so its loadings name the repair genes that move with proliferation in TNBC.
+Xr = (logn.loc[repair_present].T - logn.loc[repair_present].T.mean()) / logn.loc[repair_present].T.std()
+rep_pca = PCA(n_components=2, random_state=SEED).fit(Xr)
+load1 = pd.Series(rep_pca.components_[0], index=repair_present)
+score1 = rep_pca.transform(Xr)[:, 0]
+if stats.spearmanr(score1, prolif_score)[0] < 0:          # PC1 sign is arbitrary; orient it so that
+    load1 = -load1                                         # the positive end = high-proliferation / TNBC
+load1 = load1.sort_values()
+top = pd.concat([load1.head(12), load1.tail(12)])          # 12 lowest + 12 highest loadings
+fig, ax = plt.subplots(figsize=(6, 8))
+ax.barh(repair.loc[top.index, "symbol"], top.values,
+        color=["#C0392B" if v > 0 else "#2471A3" for v in top.values])
+ax.axvline(0, color="k", lw=0.6)
+ax.set(title="Genes loading on PC1 of the repair-gene PCA\n(positive end = high-proliferation / TNBC direction)",
+       xlabel="PC1 loading")
+plt.tight_layout(); plt.show()
+print("High-proliferation end:", ", ".join(repair.loc[load1.tail(8).index[::-1], "symbol"]))
+print("Opposite end:         ", ", ".join(repair.loc[load1.head(8).index, "symbol"]))
+
 # %% [markdown]
 # **Interpretation (Stage 4).** 
 #
 # * **Cohort:** TNBC patients are younger (median age 54 vs 60, p = 1 × 10⁻⁴) and much more often Black / African American (33.8% vs 13.7%, p ≈ 10⁻⁸). This matches the epidemiology of TNBC (Carey et al., 2006). It also shows the representation problem from our ethics presentation: most patients are White (57–70%), about 5% are Asian, and none were recruited in Africa.
 # * **Genome-wide PCA:** TNBC tumours form their own cluster at the negative end of PC1. TNBC differs across the whole transcriptome, not just in a few genes; this is the basal-like phenotype.
 # * **Repair-gene PCA:** using only the 148 repair genes, TNBC still shift along PC1 (AUC 0.78). But repair-gene PC1 is strongly correlated with the proliferation score (ρ = 0.81), so the main axis of variation among repair genes is a **proliferation axis**.
+# * **What drives repair-gene PC1:** the positive (high-proliferation / TNBC) end of PC1 is built from replication-coupled HR and Fanconi-anaemia genes together with S-phase checkpoint and mismatch-repair genes (*RAD51AP1, BLM, EXO1, FANCB, FANCI, FANCD2, MSH2, MSH6, CHEK1, TOPBP1, DNA2, NEIL3*) — genes that are switched on in dividing cells. Because these same genes define PC1 and PC1 tracks the proliferation score (ρ = 0.81), the main "repair" axis is really a **cell-cycle axis**: the repair genes that look high in TNBC are largely the ones expressed in proliferating tumours. The opposite end carries base- and nucleotide-excision-repair genes and back-up / translesion polymerases (*NEIL1, MPG, POLM, POLL, POLN, POLD4, PARP3, FAAP20, ERCC1, XPA, CCNH, ATRIP*), repair activities that are not replication-coupled. This is exactly why Stage 5 removes the proliferation effect before trusting any repair-specific difference.
 # * **Repair vs proliferation:** the average repair score tracks proliferation closely (ρ = 0.76). TNBC sit at the high-proliferation end (median proliferation z-score 0.95 vs −0.09), yet their mean repair score is only slightly higher (0.14 vs −0.04). Averaging over all repair genes hides genes that move in opposite directions.
 # * **Heatmap:** clustering places most TNBC tumours together in one block of columns. In that block, a large group of HR, FA and replication genes (*BLM, FANCA, FANCD2, FANCI, RAD51, RAD51AP1, EXO1, CHEK1, BRCA2, UBE2T …*) is high. A smaller set (*RAD50, MSH3, POLK, XPC …*) is low in part of the same block. Stage 5 tests both patterns formally.
 
@@ -771,7 +793,137 @@ for ax in axes[len(show):]: ax.axis("off")
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# **Interpretation (Stage 5).** 
+# ### 5.5 Robustness to age
+#
+# TNBC patients are younger than non-TNBC patients (median 54 vs 60, Stage 4), and age itself changes gene expression. So part of a "TNBC difference" could be an age difference. We re-run DESeq2 with age as a covariate, `design="~AGE + group"`, on the patients whose age is recorded. Age is standardised (mean 0, SD 1) so the model fits well; this does not change the TNBC coefficient.
+#
+# Dropping patients also changes the estimates a little, so we fit a third model, `~group` on the **same** patients. Comparing the three separates the effect of the smaller sample from the effect of adjusting for age.
+
+# %%
+age = pd.to_numeric(cohort["AGE"], errors="coerce").reindex(counts_f.columns)
+has_age = age.notna().values
+print(f"{int((~has_age).sum())} patients without a recorded age are dropped; "
+      f"{int(has_age.sum())} remain ({int(y.values[has_age].sum())} TNBC, {int((1 - y.values)[has_age].sum())} non-TNBC)")
+meta_age = meta.loc[has_age].copy()
+meta_age["AGE"] = ((age[has_age] - age[has_age].mean()) / age[has_age].std()).values
+counts_age = counts_f.loc[:, has_age].T.astype(int)
+
+def run_deseq(design):
+    """Fit DESeq2 on the patients with age and return the TNBC-vs-non-TNBC results table."""
+    d = DeseqDataSet(counts=counts_age, metadata=meta_age, design=design,
+                     refit_cooks=True, inference=inference, quiet=True)
+    d.deseq2()
+    s = DeseqStats(d, contrast=["group", "TNBC", "nonTNBC"], inference=inference, quiet=True)
+    s.summary()
+    r = s.results_df.copy()
+    r.index = r.index.astype(int)
+    return d, r
+
+t0 = time.time()
+dds_age, de_age = run_deseq("~AGE + group")          # age-adjusted
+_, de_same = run_deseq("~group")                     # unadjusted, same patients
+print(f"two extra DESeq2 fits finished in {time.time()-t0:.0f}s")
+
+# Age effect itself (natural-log LFC per SD of age -> log2 per 10 years)
+age_lfc = dds_age.varm["LFC"]["AGE"] / np.log(2) / age[has_age].std() * 10
+age_lfc.index = age_lfc.index.astype(int)            # DESeq2 stores gene IDs as text
+print(f"median |age effect| on repair genes: {age_lfc.reindex(counts_f.index).loc[repair_present].abs().median():.3f} "
+      f"log2 per 10 years (TNBC effect: {rep.log2FoldChange.abs().median():.3f})")
+
+cmp_age = pd.DataFrame({
+    "symbol": rep.symbol,
+    "lfc_original": rep.log2FoldChange,
+    "lfc_same_patients": de_same.loc[rep.index, "log2FoldChange"],
+    "lfc_age_adjusted": de_age.loc[rep.index, "log2FoldChange"],
+    "padj_age_adjusted": de_age.loc[rep.index, "padj"],
+})
+cmp_age["padj_repair_family_age"] = multipletests(de_age.loc[rep.index, "pvalue"], method="fdr_bh")[1]
+cmp_age["call_age_adjusted"] = [call(pd.Series({"padj_repair_family": p, "log2FoldChange": l}))
+                                for p, l in zip(cmp_age.padj_repair_family_age, cmp_age.lfc_age_adjusted)]
+cmp_age["call_original"] = rep["call"]
+cmp_age["change"] = cmp_age.lfc_age_adjusted - cmp_age.lfc_original
+
+r_p = stats.pearsonr(cmp_age.lfc_original, cmp_age.lfc_age_adjusted)[0]
+r_s = stats.spearmanr(cmp_age.lfc_original, cmp_age.lfc_age_adjusted)[0]
+r_sub = stats.pearsonr(cmp_age.lfc_same_patients, cmp_age.lfc_age_adjusted)[0]
+sig0 = rep.padj_repair_family < 0.05
+sig1 = cmp_age.padj_repair_family_age < 0.05
+print(f"\nRepair-gene log2FC, original vs age-adjusted: Pearson r = {r_p:.3f}, Spearman ρ = {r_s:.3f}")
+print(f"same patients without vs with age: Pearson r = {r_sub:.3f}")
+print(f"median |change| in log2FC: {cmp_age.change.abs().median():.3f}; largest: {cmp_age.change.abs().max():.3f} "
+      f"({cmp_age.loc[cmp_age.change.abs().idxmax(), 'symbol']})")
+print(f"significant (repair-family FDR < 0.05): {int(sig0.sum())} originally, {int(sig1.sum())} age-adjusted; "
+      f"same call for {(sig0 == sig1).mean():.0%} of genes; same direction for "
+      f"{(np.sign(cmp_age.lfc_original) == np.sign(cmp_age.lfc_age_adjusted)).mean():.0%}")
+print(f"up / down after age adjustment: {int((sig1 & (cmp_age.lfc_age_adjusted > 0)).sum())} / "
+      f"{int((sig1 & (cmp_age.lfc_age_adjusted < 0)).sum())} (originally {int((sig0 & (rep.log2FoldChange > 0)).sum())} / "
+      f"{int((sig0 & (rep.log2FoldChange < 0)).sum())})")
+TWOFOLD = ["UP ≥2x in TNBC", "DOWN ≥2x in TNBC"]
+print("≥2-fold calls, original:", ", ".join(cmp_age.symbol[cmp_age.call_original.isin(TWOFOLD)]))
+print("≥2-fold calls, age-adjusted:", ", ".join(cmp_age.symbol[cmp_age.call_age_adjusted.isin(TWOFOLD)]))
+changed = cmp_age[cmp_age.call_original != cmp_age.call_age_adjusted]
+print(f"\n{len(changed)} repair genes change their call after age adjustment:")
+display(changed[["symbol", "lfc_original", "lfc_age_adjusted", "call_original", "call_age_adjusted"]].round(3))
+print("Largest shifts in log2FC:")
+display(cmp_age.reindex(cmp_age.change.abs().sort_values(ascending=False).index).head(8)[
+    ["symbol", "lfc_original", "lfc_same_patients", "lfc_age_adjusted", "change"]].round(3))
+cmp_age.to_csv(os.path.join(RESULTS_DIR, "dna_repair_age_adjusted.csv"))
+
+fig, ax = plt.subplots(figsize=(6.5, 6))
+ax.scatter(cmp_age.lfc_original, cmp_age.lfc_age_adjusted, s=20, c=np.where(sig1, "#C0392B", "#AAB7B8"),
+           edgecolor="k", lw=0.3)
+lim = [cmp_age[["lfc_original", "lfc_age_adjusted"]].min().min() - 0.1,
+       cmp_age[["lfc_original", "lfc_age_adjusted"]].max().max() + 0.1]
+ax.plot(lim, lim, ls="--", c="grey", lw=0.8); ax.axhline(0, c="k", lw=0.6); ax.axvline(0, c="k", lw=0.6)
+for eid in cmp_age.change.abs().sort_values().index[-6:]:
+    ax.annotate(cmp_age.symbol[eid], (cmp_age.lfc_original[eid], cmp_age.lfc_age_adjusted[eid]),
+                fontsize=7, xytext=(3, 2), textcoords="offset points")
+ax.scatter([], [], c="#C0392B", s=20, label="FDR < 0.05 after age adjustment")
+ax.scatter([], [], c="#AAB7B8", s=20, label="not significant")
+ax.set(xlabel="log2FC, original model (~group)", ylabel="log2FC, age-adjusted model (~AGE + group)",
+       title=f"Repair-gene fold changes with and without age\nPearson r = {r_p:.3f}")
+ax.legend(fontsize=8, loc="upper left"); plt.tight_layout(); plt.show()
+
+# %% [markdown]
+# ### 5.6 Shrunken fold changes
+#
+# Raw DESeq2 fold changes are noisy for genes with low counts or high dispersion. `lfc_shrink()` (apeGLM prior) pulls those estimates towards zero while leaving well-measured genes almost unchanged. This makes the ranking by effect size more reliable. We use a separate `DeseqStats` object so the original results used later in the notebook stay untouched.
+
+# %%
+t0 = time.time()
+ds_shr = DeseqStats(dds, contrast=["group", "TNBC", "nonTNBC"], inference=inference, quiet=True)
+ds_shr.summary()
+# The design's reference level is "TNBC" (alphabetical), so the model coefficient is group[T.nonTNBC].
+# lfc_shrink() writes that raw coefficient into results_df, so we flip its sign back to TNBC vs non-TNBC.
+LFC_COEF = [c for c in dds.varm["LFC"].columns if c.startswith("group")][0]
+ds_shr.lfc_shrink(coeff=LFC_COEF)
+shr = ds_shr.results_df.copy()
+shr.index = shr.index.astype(int)
+if LFC_COEF.endswith("nonTNBC]"):
+    shr["log2FoldChange"] = -shr["log2FoldChange"]
+assert stats.spearmanr(shr.loc[rep.index, "log2FoldChange"], rep.log2FoldChange)[0] > 0.9, "shrunken LFC sign check failed"
+print(f"LFC shrinkage finished in {time.time()-t0:.0f}s")
+
+rep_shr = rep[["symbol", "pathways", "baseMean", "log2FoldChange", "lfcSE", "padj_repair_family", "call"]].copy()
+rep_shr["log2FC_shrunk"] = shr.loc[rep.index, "log2FoldChange"]
+rep_shr["lfcSE_shrunk"] = shr.loc[rep.index, "lfcSE"]
+rep_shr["shrink"] = rep_shr.log2FC_shrunk - rep_shr.log2FoldChange
+print(f"Repair genes, raw vs shrunken log2FC: Pearson r = {stats.pearsonr(rep_shr.log2FoldChange, rep_shr.log2FC_shrunk)[0]:.4f}; "
+      f"median |shrinkage| = {rep_shr.shrink.abs().median():.4f}; largest = {rep_shr.shrink.abs().max():.3f} "
+      f"({rep_shr.loc[rep_shr.shrink.abs().idxmax(), 'symbol']})")
+print(f"genes with |shrunken log2FC| ≥ 1 and repair-family FDR < 0.05: "
+      f"{int(((rep_shr.log2FC_shrunk.abs() >= 1) & (rep_shr.padj_repair_family < 0.05)).sum())} "
+      f"(raw: {int(rep_shr.call.isin(TWOFOLD).sum())})")
+print("\nRepair genes ranked by shrunken log2FC (top 12 up, top 5 down):")
+rep_shr = rep_shr.sort_values("log2FC_shrunk", ascending=False)
+display(rep_shr.head(12).round(3))
+display(rep_shr.tail(5).iloc[::-1].round(3))
+print("Genes most affected by shrinkage:")
+display(rep_shr.reindex(rep_shr.shrink.abs().sort_values(ascending=False).index).head(5).round(3))
+rep_shr.to_csv(os.path.join(RESULTS_DIR, "dna_repair_DE_shrunken.csv"))
+
+# %% [markdown]
+# **Interpretation (Stage 5).**
 #
 # * **Sanity:** the receptor genes come out as expected (*ESR1* log2FC −5.0, *PGR* −4.1, *ERBB2* −2.2), as do the basal markers (*FOXC1* +3.0, *KRT5* +2.5). So the contrast direction and the labels are correct.
 # * **Genome-wide:** 13,377 of 16,697 genes (80%) have FDR < 0.05. With 1,006 tumours almost everything is statistically "different", so effect sizes and gene-set comparisons matter more than p-values.
@@ -783,6 +935,8 @@ plt.tight_layout(); plt.show()
 #   * **Lower** than proliferation predicts (67 genes): led by ***BRCA1*** (−0.84 log2), then *POLN, POLD4, RAD50, EME2, ATRIP, MSH3*.
 #
 #   The adjusted estimate is the part of the TNBC difference that proliferation cannot explain. It is not the "true" effect: if TNBC biology drives both proliferation and repair expression, adjustment removes some real signal too.
+# * **Age (robustness check):** TNBC patients are younger, so we re-ran DESeq2 with age as a covariate (`~AGE + group`) on the 992 patients with a recorded age (14 dropped; 157 TNBC, 835 non-TNBC). The repair-gene fold changes are practically identical to the original ones (Pearson r = 1.000, Spearman ρ = 0.999). The median change is 0.009 log2 units and the largest is 0.072 (*NTHL1*, a gene with almost no TNBC effect). 115 instead of 116 repair genes stay significant (79 up, 36 down). Only *RAD51C* changes its call, from slightly down (log2FC −0.16) to not significant (−0.14). The same eleven genes change at least two-fold. Fitting `~group` on the same 992 patients gives the same fold changes too (r = 1.000), so neither dropping the patients without age nor adjusting for age changes anything. **The TNBC repair-gene differences are not an age effect.** The model only adjusts for a linear age trend, which is the usual assumption.
+# * **Shrunken fold changes:** apeGLM shrinkage hardly moves any repair-gene estimate (r = 1.0000 with the raw values; median shift 0.002, largest 0.012 for *POLN*). The ranking and the eleven ≥2-fold genes stay the same, led by *FANCA* (1.37), *RAD54L* (1.36) and *CHEK1* (1.28), with *POLN* (−1.14) the only one down. This is expected: with ~1,000 tumours and well-expressed genes the standard errors are small (lfcSE 0.06–0.10), so the prior has little to correct. The raw fold changes reported above can be trusted as effect sizes.
 
 # %% [markdown]
 # ## Stage 6 · Biological interpretation
@@ -993,6 +1147,54 @@ display(cv_table)
 print(f"random gene sets: CV ROC-AUC range {min(rand_aucs):.3f}–{max(rand_aucs):.3f}; "
       f"repair genes beat {np.mean(np.array(rand_aucs) < lr_search.best_score_):.0%} of the 30 random sets")
 
+# %% [markdown]
+# ### Repeated cross-validation of the baselines
+# One 5-fold split gives a single number per model. Repeating 5-fold CV five times with different shuffles (25 fits per model, training set only) shows how much each score varies. We need that to judge whether the small gap between repair genes and random genes is real. Every model is scored on the **same 25 splits**, so the scores can be compared fold by fold.
+
+# %%
+from sklearn.model_selection import RepeatedStratifiedKFold
+
+rcv = RepeatedStratifiedKFold(n_splits=5, n_repeats=5, random_state=SEED)
+
+def rcv_auc(model, X):
+    return cross_val_score(model, X.loc[idx_train], y_train, cv=rcv, scoring="roc_auc", n_jobs=-1)
+
+rcv_scores = {
+    "Majority class (dummy)": rcv_auc(DummyClassifier(strategy="most_frequent"), X_pro),
+    "Proliferation score only (LR)": rcv_auc(logreg(), X_pro),
+    "DNA-repair genes (LR)": rcv_auc(logreg(best_C), X_rep),
+    "DNA-repair genes (random forest)": rcv_auc(rf_search.best_estimator_, X_rep),
+    "DNA-repair genes + proliferation (LR)": rcv_auc(logreg(best_C), X_both),
+}
+
+# 30 random sets of non-repair genes, each scored on the same 25 splits.
+# A separate random generator keeps the shared `rng` (used later for the bootstrap CI) unchanged.
+my_rng = np.random.default_rng(SEED)
+random_fold_scores = np.array([rcv_auc(logreg(best_C), logn.loc[my_rng.choice(pool, len(repair_present), replace=False)].T)
+                               for _ in range(30)])                     # shape: 30 sets x 25 folds
+rcv_scores[f"Random {len(repair_present)} genes (LR, 30 sets)"] = random_fold_scores.ravel()
+
+rcv_table = pd.DataFrame({name: {"mean ROC-AUC": s.mean(), "SD across folds": s.std(ddof=1),
+                                 "min": s.min(), "max": s.max()} for name, s in rcv_scores.items()}).T.round(3)
+display(rcv_table)
+
+repair_lr = rcv_scores["DNA-repair genes (LR)"]
+set_means = random_fold_scores.mean(axis=1)
+diff = repair_lr - random_fold_scores                                   # paired: same folds
+print(f"Repair-gene LR mean AUC {repair_lr.mean():.3f} is higher than {np.mean(set_means < repair_lr.mean()):.0%} "
+      f"of the 30 random-set means (random sets: {set_means.mean():.3f} ± {set_means.std(ddof=1):.3f}).")
+print(f"Paired difference, repair minus random (same folds): {diff.mean():+.4f} AUC "
+      f"(SD {diff.std(ddof=1):.4f}); repair genes win in {np.mean(diff > 0):.0%} of set-fold pairs.")
+
+fig, ax = plt.subplots(figsize=(10, 4.5))
+order_m = list(rcv_scores)
+sns.boxplot(data=[rcv_scores[m] for m in order_m], orient="h", ax=ax, color="#D6EAF8", fliersize=2)
+ax.set_yticks(range(len(order_m)))
+ax.set_yticklabels(order_m)
+ax.set(xlabel="ROC-AUC (5 × 5 repeated CV, training set)", title="Model comparison with fold-to-fold variation")
+ax.axvline(0.5, ls="--", c="grey", lw=0.8)
+plt.tight_layout(); plt.show()
+
 # %%
 # Final evaluation on the untouched test set
 final_models = {
@@ -1042,6 +1244,39 @@ sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=axes[2],
 axes[2].set_title("Confusion matrix · DNA-repair LR (threshold 0.5)")
 plt.tight_layout(); plt.show()
 
+# %% [markdown]
+# ### Tuning the random forest's decision threshold
+# At the default 0.5 threshold the random forest finds few TNBC tumours: with only ~16% TNBC its probabilities rarely reach 0.5. We choose a better threshold using **out-of-fold predictions on the training set only**, then apply that single threshold to the test set once. This keeps the test set untouched by the tuning.
+
+# %%
+from sklearn.model_selection import cross_val_predict
+
+rf_oof = cross_val_predict(rf_search.best_estimator_, X_rep.loc[idx_train], y_train, cv=cv, method="predict_proba")[:, 1]
+thresholds = np.round(np.arange(0.05, 0.951, 0.01), 2)
+ba_oof = np.array([balanced_accuracy_score(y_train, (rf_oof >= t).astype(int)) for t in thresholds])
+t_best = float(thresholds[ba_oof.argmax()])
+print(f"threshold chosen on training out-of-fold predictions: {t_best:.2f} "
+      f"(training balanced accuracy {ba_oof.max():.3f} vs {ba_oof[thresholds == 0.5][0]:.3f} at 0.50)")
+
+p_rf = curves["DNA-repair genes (random forest)"]
+thr_rows = []
+for label, t in [("0.50 (default)", 0.5), (f"{t_best:.2f} (tuned on training data)", t_best)]:
+    pred = (p_rf >= t).astype(int)
+    tn_, fp_, fn_, tp_ = confusion_matrix(y_test, pred, labels=[0, 1]).ravel()
+    thr_rows.append({"RF threshold": label, "balanced accuracy": balanced_accuracy_score(y_test, pred),
+                     "sensitivity (TNBC recall)": tp_ / (tp_ + fn_), "specificity": tn_ / (tn_ + fp_),
+                     "F1 (TNBC)": f1_score(y_test, pred, zero_division=0), "TNBC found": f"{tp_} of {tp_ + fn_}"})
+thr_table = pd.DataFrame(thr_rows).set_index("RF threshold").round(3)
+display(thr_table)
+print(f"test ROC-AUC is unchanged by the threshold: {roc_auc_score(y_test, p_rf):.3f}")
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+ax.plot(thresholds, ba_oof, c="#1F618D")
+ax.axvline(t_best, ls="--", c="#C0392B", label=f"chosen threshold {t_best:.2f}")
+ax.axvline(0.5, ls=":", c="grey", label="default 0.50")
+ax.set(xlabel="decision threshold", ylabel="balanced accuracy (out-of-fold)", title="Random forest: choosing the threshold on training data")
+ax.legend(); plt.tight_layout(); plt.show()
+
 # %%
 # Which repair genes does the logistic regression rely on? (standardised coefficients)
 coef = pd.Series(lr_search.best_estimator_.named_steps["logisticregression"].coef_[0], index=X_rep.columns)
@@ -1055,12 +1290,38 @@ print("Spearman correlation between LR coefficient and adjusted TNBC difference:
       round(stats.spearmanr(coef, adj.set_index("symbol").loc[coef.index, "diff_adjusted"])[0], 2))
 
 # %% [markdown]
+# ### Permutation importance (test set)
+# Coefficients show what the model learned. Permutation importance asks what it actually *uses* on unseen data: shuffle one gene in the test set and measure how much ROC-AUC drops (30 shuffles per gene).
+
+# %%
+from sklearn.inspection import permutation_importance
+
+pi = permutation_importance(lr_search.best_estimator_, X_rep.loc[idx_test], y_test, scoring="roc_auc",
+                            n_repeats=30, random_state=SEED, n_jobs=-1)
+imp = pd.DataFrame({"drop in ROC-AUC": pi.importances_mean, "SD": pi.importances_std}, index=X_rep.columns)
+imp = imp.sort_values("drop in ROC-AUC", ascending=False)
+top_pi = imp.head(15)
+
+fig, ax = plt.subplots(figsize=(7, 5.5))
+ax.barh(top_pi.index[::-1], top_pi["drop in ROC-AUC"][::-1], xerr=top_pi["SD"][::-1], color="#5D6D7E")
+ax.set(xlabel="mean drop in test ROC-AUC when the gene is shuffled", title="Top 15 genes by permutation importance · repair-gene LR")
+plt.tight_layout(); plt.show()
+
+overlap = sorted(set(top_pi.index) & set(top.index))
+print(f"genes with any measurable importance (mean drop > 0): {int((imp['drop in ROC-AUC'] > 0).sum())} of {len(imp)}")
+print(f"largest single-gene drop: {imp['drop in ROC-AUC'].iloc[0]:.4f} AUC ({imp.index[0]})")
+print(f"{len(overlap)} of the top 15 permutation genes are also in the top 20 coefficients: {', '.join(overlap)}")
+
+# %% [markdown]
 # **Interpretation (Stage 7).** 
 #
 # * **Model selection (training set, 5-fold CV):** logistic regression with strong regularisation (C = 0.01) did best (CV ROC-AUC 0.970), slightly ahead of the random forest (0.951).
-# * **Against the baselines:** the repair-gene model clearly beats the majority-class baseline (AUC 0.50) and the proliferation-only model (CV 0.84, test 0.83). So repair genes carry information beyond "this tumour divides fast", and adding the proliferation score to them adds nothing (0.970). **But 30 random sets of 148 non-repair genes do almost as well** (mean CV AUC 0.966, range 0.960–0.972). The repair genes beat 93% of the random sets, but only by about 0.004 AUC, which is not a meaningful difference.
-# * **Test set (used once):** the repair-gene logistic regression reaches **ROC-AUC 0.93 (95% CI 0.87–0.97)** and PR-AUC 0.66 (chance level 0.16). Balanced accuracy is 0.87, with sensitivity 0.81 (26 of 32 TNBC found) and specificity 0.93 (158 of 170 non-TNBC correct). The random forest has a similar AUC (0.92), but at the default 0.5 threshold it finds only 44% of TNBC: its probabilities for the rare class are poorly calibrated. We would have to tune its threshold inside cross-validation, so logistic regression is our preferred model. The test AUC is a little lower than CV (0.93 vs 0.97); with only 32 TNBC in the test set this is within the uncertainty, and nothing was tuned on the test set.
+# * **Against the baselines:** the repair-gene model clearly beats the majority-class baseline (AUC 0.50) and the proliferation-only model (CV 0.84, test 0.83). So repair genes carry information beyond "this tumour divides fast", and adding the proliferation score to them adds nothing. **But 30 random sets of 148 non-repair genes do just as well.**
+# * **Repeated cross-validation (5 × 5, same splits for every model):** this confirms the point above and makes it sharper. The repair-gene model scores 0.969 ± 0.013 and the random gene sets 0.967 ± 0.013. Scored on identical folds, the repair genes are ahead by only +0.002 AUC (SD 0.008) and win in just 60% of the comparisons. They beat 77% of the random-set means, down from 93% with the single 5-fold split, so the single split flattered the repair genes. The proliferation-only model is not only weaker (0.843) but also the least stable (SD 0.045, range 0.74–0.91).
+# * **Test set (used once):** the repair-gene logistic regression reaches **ROC-AUC 0.93 (95% CI 0.87–0.97)** and PR-AUC 0.66 (chance level 0.16). Balanced accuracy is 0.87, with sensitivity 0.81 (26 of 32 TNBC found) and specificity 0.93 (158 of 170 non-TNBC correct). The test AUC is a little lower than CV (0.93 vs 0.97); with only 32 TNBC in the test set this is within the uncertainty, and nothing was tuned on the test set.
+# * **Random forest threshold:** at the default 0.5 threshold the random forest finds only 14 of 32 TNBC, because its probabilities for the rare class are low. A threshold of 0.25, chosen on training out-of-fold predictions only, raises test sensitivity from 44% to 75% (24 of 32) and balanced accuracy from 0.70 to 0.84. Specificity drops slightly (0.96 → 0.92), and ROC-AUC is unchanged (0.915) because it does not depend on the threshold. Even tuned, the random forest stays below the logistic regression (balanced accuracy 0.84 vs 0.87), so logistic regression remains our preferred model.
 # * **What the model uses:** the largest coefficients are *FANCE, SEM1, RAD51B, GTF2H1, ATM* (towards TNBC) and *ATRIP, RAD50, RAD17, POLL, POLD4, POLN* (towards non-TNBC). The coefficients correlate with the proliferation-adjusted differences from Stage 5 (ρ = 0.84). The model relies on the proliferation-independent part of the repair profile, the same genes our statistics highlighted.
+# * **Permutation importance:** no single gene matters much. Shuffling the most important gene, *ATM*, lowers test AUC by only 0.006, and only 67 of the 148 genes have any measurable effect. 9 of the top 15 genes (*ATM, DCLRE1C, FANCA, PARP4, POLD4, POLL, POLN, RAD51B, XPA*) are also among the top 20 coefficients, so the two methods broadly agree. The information is spread across many correlated genes, which is also why random gene sets can do the same job.
 # * **Honest conclusion:** DNA-repair expression classifies TNBC well, but that does **not** show repair genes are special. TNBC are so different transcriptome-wide that almost any 148 genes would do. The classifier confirms a distinct profile; it is not evidence of a repair-specific biomarker.
 
 # %% [markdown]
