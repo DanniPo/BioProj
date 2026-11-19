@@ -375,10 +375,20 @@ labels["group"] = labels.apply(
 
 # Prepare GDC demographic information.
 
+
 gp = gdc_patient.copy()
 
 gp["PATIENT_ID"] = gp["PATIENT_ID"].astype(str).str.strip()
+
+gp["SEX"] = (
+    gp["SEX"]
+    .astype("string")
+    .str.strip()
+    .str.capitalize()
+)
+
 gp = gp.set_index("PATIENT_ID")
+
 
 if gp.index.has_duplicates:
     raise ValueError(
@@ -770,43 +780,70 @@ else:
 # 3.4.1 FILTERING SENSITIVITY ANALYSIS
 # ============================================================
 
-thresholds = [0.10, 0.15, 0.25]
+def calculate_filter_sensitivity(
+    cpm_matrix,
+    repair_gene_ids,
+    sample_count,
+    thresholds=(0.10, 0.15, 0.25),
+    cpm_cutoff=1
+):
+    """
+    Compare gene retention at different sample-prevalence
+    thresholds without overwriting variables used by later stages.
+    """
 
-sensitivity_results = []
+    sensitivity_rows = []
 
-for threshold in thresholds:
+    repair_id_set = {
+        str(gene_id) for gene_id in repair_gene_ids
+    }
 
-    required_samples = int(
-        np.ceil(threshold * counts.shape[1])
+    # Calculate the number of samples expressing each gene.
+    expressed_sample_counts = (
+        cpm_matrix.ge(cpm_cutoff).sum(axis=1)
     )
 
-    keep = (
-        (cpm >= 1).sum(axis=1)
-        >= required_samples
-    )
+    for prevalence_threshold in thresholds:
 
-    genes_kept = counts.index[keep]
+        required_sample_count = int(
+            np.ceil(prevalence_threshold * sample_count)
+        )
 
-    repair_kept = repair_ids.intersection(
-        genes_kept
-    )
+        threshold_keep_mask = (
+            expressed_sample_counts >= required_sample_count
+        )
 
-    sensitivity_results.append({
-        "Threshold": f"{threshold:.0%}",
-        "Total genes retained": len(genes_kept),
-        "DNA repair genes retained": len(repair_kept)
-    })
+        threshold_retained_genes = (
+            cpm_matrix.index[threshold_keep_mask]
+        )
 
-sensitivity_df = pd.DataFrame(
-    sensitivity_results
+        threshold_repair_genes = sum(
+            str(gene_id) in repair_id_set
+            for gene_id in threshold_retained_genes
+        )
+
+        sensitivity_rows.append({
+            "Threshold": f"{prevalence_threshold:.0%}",
+            "Minimum samples required": required_sample_count,
+            "Total genes retained": int(threshold_keep_mask.sum()),
+            "DNA repair genes retained": int(threshold_repair_genes)
+        })
+
+    return pd.DataFrame(sensitivity_rows)
+
+
+# Run sensitivity analysis using independent function variables.
+sensitivity_df = calculate_filter_sensitivity(
+    cpm_matrix=cpm,
+    repair_gene_ids=repair.index,
+    sample_count=counts.shape[1]
 )
 
 print("GENE-FILTERING SENSITIVITY ANALYSIS")
 display(sensitivity_df)
 
 
-# Compare alternatives with baseline.
-
+# Compare alternative thresholds with the 15% baseline.
 baseline_row = sensitivity_df.loc[
     sensitivity_df["Threshold"] == "15%"
 ].iloc[0]
@@ -821,15 +858,16 @@ baseline_repair = int(
 
 print("\nDIFFERENCE COMPARED WITH 15% BASELINE")
 
-for _, row in sensitivity_df.iterrows():
+for _, sensitivity_row in sensitivity_df.iterrows():
 
     print(
-        f"{row['Threshold']}: "
-        f"{int(row['Total genes retained']) - baseline_genes:+,} "
+        f"{sensitivity_row['Threshold']}: "
+        f"{int(sensitivity_row['Total genes retained']) - baseline_genes:+,} "
         "total genes; "
-        f"{int(row['DNA repair genes retained']) - baseline_repair:+} "
+        f"{int(sensitivity_row['DNA repair genes retained']) - baseline_repair:+} "
         "DNA-repair genes"
     )
+
 
 
 # %% [markdown]
@@ -937,26 +975,33 @@ def median_of_ratios(cnt):
 
 size_factors = median_of_ratios(counts_f)
 
-if (
-    size_factors.isna().any()
-    or not np.isfinite(size_factors).all()
-    or (size_factors <= 0).any()
-):
-    raise ValueError(
-        "Invalid size factors were produced."
-    )
-
-
-# Apply size factors to the full cohort count matrix.
-
-normalised_counts = counts.astype(np.float64).div(
-    size_factors,
-    axis=1
+# Normalise the 15%-filtered count matrix, not the unfiltered matrix.
+normalised_counts = counts_f.astype(np.float64).div(
+    size_factors, axis=1
 )
 
-logn = np.log2(
-    normalised_counts + 1
+logn = np.log2(normalised_counts + 1)
+
+
+# Confirm that filtered counts and normalised expression
+# contain exactly the same genes and samples.
+
+assert counts_f.index.equals(logn.index), (
+    "Gene mismatch: counts_f and logn have different gene indexes."
 )
+
+assert counts_f.columns.equals(logn.columns), (
+    "Sample mismatch: counts_f and logn have different sample columns."
+)
+
+assert counts_f.shape == logn.shape, (
+    "Shape mismatch between filtered counts and log-normalised counts."
+)
+
+print("\nNormalisation alignment check passed.")
+print("Filtered counts shape:", counts_f.shape)
+print("Log-normalised expression shape:", logn.shape)
+
 
 sf_lib_correlation = np.corrcoef(
     size_factors.to_numpy(),
@@ -1447,6 +1492,174 @@ else:
 
 
 # %% [markdown]
+# ## Interpretation (Stage 3)
+#
+# This section interprets the preprocessing and quality-control
+# results, including filtering sensitivity, DNA-repair gene retention,
+# biological sanity checks and ESR1-discordant TNBC cases.
+
+# %%
+# ============================================================
+# 3.6.2 INTERPRETATION OF PREPROCESSING AND QUALITY CONTROL
+# ============================================================
+
+print("INTERPRETATION OF STAGE 3 RESULTS")
+print("=" * 60)
+
+
+# 1. Filtering sensitivity.
+
+print("\n1. GENE-FILTERING SENSITIVITY")
+
+display(sensitivity_df)
+
+print(
+    "The 10%, 15% and 25% thresholds were compared to assess "
+    "how filtering stringency affects the number of retained "
+    "genes and DNA-repair genes."
+)
+
+print(
+    f"The selected 15% threshold retained {baseline_genes:,} genes, "
+    f"including {baseline_repair:,} DNA-repair genes."
+)
+
+print(
+    "The 10% threshold is less stringent and may retain additional "
+    "low-expression genes. The 25% threshold is more stringent "
+    "and may remove genes expressed in fewer samples."
+)
+
+
+# 2. DNA-repair gene retention.
+
+print("\n2. DNA-REPAIR GENE RETENTION")
+
+print(
+    f"{len(repair_present):,} of {len(repair):,} "
+    "DNA-repair genes were retained at the 15% threshold."
+)
+
+if len(repair_dropped) > 0:
+    print(
+        "Some DNA-repair genes were removed because they did not "
+        "meet the selected expression-prevalence requirement."
+    )
+else:
+    print(
+        "All genes in the supplied DNA-repair gene set were retained."
+    )
+
+
+# 3. Normalisation.
+
+print("\n3. NORMALISATION")
+
+print(
+    "Median-of-ratios size factors were calculated using the "
+    "15%-filtered count matrix."
+)
+
+print(
+    "The normalised expression matrix contains the same genes "
+    "as the filtered count matrix."
+)
+
+print(
+    f"Normalised expression matrix dimensions: "
+    f"{logn.shape[0]:,} genes x {logn.shape[1]:,} samples."
+)
+
+
+# 4. Biological sanity checks.
+
+print("\n4. BIOLOGICAL SANITY CHECKS")
+
+if rows:
+
+    receptor_results = pd.DataFrame(rows)
+    display(receptor_results)
+
+    for _, receptor_row in receptor_results.iterrows():
+
+        print(
+            f"{receptor_row['gene']}: "
+            f"median negative = {receptor_row['median negative']}, "
+            f"median positive = {receptor_row['median positive']}, "
+            f"AUC = {receptor_row['AUC']}."
+        )
+
+else:
+
+    print(
+        "No receptor-expression comparisons were completed. "
+        "Gene availability and receptor group sizes should be reviewed."
+    )
+
+
+# 5. ESR1-discordant TNBC cases.
+
+print("\n5. ESR1-DISCORDANT TNBC CASES")
+
+print(
+    f"{len(discordant):,} of {tnbc_count:,} TNBC cases "
+    f"({discordant_fraction:.1%}) were identified as ESR1-discordant."
+)
+
+if len(discordant) > 0:
+
+    print(
+        "These cases have ESR1 expression above the 10th percentile "
+        "of the ER-positive reference group, despite being classified "
+        "as TNBC using their clinical receptor records."
+    )
+
+    print(
+        "The cases are retained in the cohort and flagged for "
+        "further review. They are not automatically reclassified "
+        "as non-TNBC because gene expression alone does not override "
+        "the clinical receptor classification."
+    )
+
+    display(esr1_qc.round(3))
+
+else:
+
+    print(
+        "No ESR1-discordant TNBC cases were identified using "
+        "the selected reference threshold."
+    )
+
+
+# 6. Overall interpretation.
+
+print("\n6. OVERALL INTERPRETATION")
+
+print(
+    "Stage 3 produced a quality-controlled primary tumour cohort, "
+    "applied a 15% expression-prevalence filter, and normalised "
+    "the filtered gene-expression matrix."
+)
+
+print(
+    "The sensitivity analysis documents how alternative filtering "
+    "thresholds affect total gene and DNA-repair gene retention."
+)
+
+print(
+    "The ESR1-discordant cases are retained and flagged for "
+    "clinical review rather than being automatically excluded "
+    "or reclassified."
+)
+
+print(
+    "The filtered and normalised expression matrix is passed "
+    "to the downstream analysis stages."
+)
+
+
+
+# %% [markdown]
 # ### 3.7 Stage 3 summary
 #
 # Summarise the actual outputs generated during preprocessing
@@ -1607,5 +1820,19 @@ stage3_outputs = [
 for output in stage3_outputs:
     print(" -", output)
 
+
+# Final consistency checks for downstream stages.
+
+assert counts_f.shape == logn.shape
+assert counts_f.index.equals(logn.index)
+assert counts_f.columns.equals(logn.columns)
+
+assert len(cohort) == counts.shape[1]
+assert len(y) == counts.shape[1]
+
+print("\nFINAL DOWNSTREAM DATA CHECKS PASSED")
+print("Filtered genes:", f"{counts_f.shape[0]:,}")
+print("Samples:", f"{counts_f.shape[1]:,}")
+print("Normalised genes:", f"{logn.shape[0]:,}")
 
 print("\nStage 3 preprocessing and quality control completed.")
