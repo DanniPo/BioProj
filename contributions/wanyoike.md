@@ -24,5 +24,5 @@ Slides for Stages 1-2: (Slide 1-5)
 ## Evidence links
 - Pull request: https://github.com/DanniPo/BioProj/pull/2
 - Commits: https://github.com/DanniPo/BioProj/pull/2/changes/6a020c4e6822c4fbdeda3bdc9ad2676184a90ee2
-- Review: (to be added)
+- Review: https://github.com/DanniPo/BioProj/pull/6
 - CI run: https://github.com/DanniPo/BioProj/actions/runs/44343190329
