@@ -46,5 +46,4 @@
 - Pull request: https://github.com/DanniPo/BioProj/pull/3
 - Commits: `cc4cbe1` (baseline), `975df5c` (Stage 7), `c82002d`, `5cef374`, `00cb685`, `9dca123`, `c0e52d6`, `cff2776`, `ebec1a9`, `70ab2e7`, `<hash>`
 - Merges: #2, #5, #6, #8, #9
-- Review: `<link>`
 - CI runs: https://github.com/DanniPo/BioProj/actions/runs/44344268107, https://github.com/DanniPo/BioProj/actions/runs/45631750622
