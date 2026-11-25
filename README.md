@@ -2,9 +2,7 @@
 
 **Computing Bioinformatics · Group Project · ICS A · Group 2**
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR-GITHUB-ACCOUNT/YOUR-REPO/blob/main/TNBC_DNA_repair_TCGA.ipynb)
-<!-- Replace YOUR-GITHUB-ACCOUNT/YOUR-REPO with this repository's path so the badge opens the notebook in Colab. -->
-
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DanniPo/BioProj/blob/main/TNBC_DNA_repair_TCGA.ipynb)
 ## Research question
 Do triple-negative breast cancers (TNBC: ER−, PR−, HER2−) show distinct DNA-repair gene expression compared with non-TNBC breast cancers in TCGA-BRCA RNA-seq data?
 
