@@ -1,11 +1,10 @@
-# Each stage lead is asked to review changes to their stage file.
-# Replace each @placeholder with the member's real GitHub username (also update team.json).
-*                                         @danni-github-username
-/stages/01_question_and_objectives.py     @wanyoike-github-username
-/stages/02_data_acquisition.py            @wanyoike-github-username
-/stages/03_preprocessing_qc.py            @arop-github-username
-/stages/04_eda.py                         @dylan-github-username
-/stages/05_core_analysis_de.py            @pete-github-username
-/stages/06_biological_interpretation.py   @kian-github-username
-/stages/07_machine_learning.py            @danni-github-username
-/stages/08_conclusions.py                 @dylan-github-username
+# Stage leads are asked to review changes to their own stage file.
+*                                         @DanniPo
+/stages/01_question_and_objectives.py     @sammacharia21
+/stages/02_data_acquisition.py            @sammacharia21
+/stages/03_preprocessing_qc.py            @abiongarop
+/stages/04_eda.py                         @dylanchezz
+/stages/05_core_analysis_de.py            @Pete-Mp256
+/stages/06_biological_interpretation.py   @Mwiberikian
+/stages/07_machine_learning.py            @DanniPo
+/stages/08_conclusions.py                 @dylanchezz
