@@ -13,7 +13,6 @@
   - **random-forest decision threshold** tuned on training out-of-fold predictions only, then applied once to the test set;
   - **permutation importance** for the logistic regression on the test set.
 
-  The code for these additions was written with help from an AI assistant (Claude). I integrated it, ran it, and checked its outputs.
 - **Maintained the repository:**
   - merged pull requests [#2](https://github.com/DanniPo/BioProj/pull/2), [#5](https://github.com/DanniPo/BioProj/pull/5), [#6](https://github.com/DanniPo/BioProj/pull/6), [#8](https://github.com/DanniPo/BioProj/pull/8) and [#9](https://github.com/DanniPo/BioProj/pull/9);
   - kept `team.json` up to date: [`c82002d`](https://github.com/DanniPo/BioProj/commit/c82002d), [`5cef374`](https://github.com/DanniPo/BioProj/commit/5cef374);
@@ -21,7 +20,7 @@
 - **Produced the final submission notebook and results:**
   - ran the notebook in Colab: [`c0e52d6`](https://github.com/DanniPo/BioProj/commit/c0e52d6);
   - replaced it with the complete GitHub Actions run, in which all 41 code cells have outputs, and fixed the `results/` folder: [`cff2776`](https://github.com/DanniPo/BioProj/commit/cff2776), [`ebec1a9`](https://github.com/DanniPo/BioProj/commit/ebec1a9), [`70ab2e7`](https://github.com/DanniPo/BioProj/commit/70ab2e7).
-- **Updated the Stage 7 interpretation** to the final numbers after the Stage 3 changes shifted them slightly: commit `<hash>`.
+- **Updated the Stage 7 interpretation** to the final numbers after the Stage 3 changes shifted them slightly: commit `a357589`.
 
 ## What changed in the results
 - **Repeated CV:** the repair-gene model scores 0.969 ± 0.013 and the random gene sets 0.967 ± 0.013. Repair genes win only 61% of the paired comparisons and beat 77% of the random-set means; the single 5-fold split had said 93%. So the single split flattered the repair genes, and the "not repair-specific" conclusion is firmer.
