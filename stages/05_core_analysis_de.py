@@ -193,7 +193,137 @@ for ax in axes[len(show):]: ax.axis("off")
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# **Interpretation (Stage 5).** 
+# ### 5.5 Robustness to age
+#
+# TNBC patients are younger than non-TNBC patients (median 54 vs 60, Stage 4), and age itself changes gene expression. So part of a "TNBC difference" could be an age difference. We re-run DESeq2 with age as a covariate, `design="~AGE + group"`, on the patients whose age is recorded. Age is standardised (mean 0, SD 1) so the model fits well; this does not change the TNBC coefficient.
+#
+# Dropping patients also changes the estimates a little, so we fit a third model, `~group` on the **same** patients. Comparing the three separates the effect of the smaller sample from the effect of adjusting for age.
+
+# %%
+age = pd.to_numeric(cohort["AGE"], errors="coerce").reindex(counts_f.columns)
+has_age = age.notna().values
+print(f"{int((~has_age).sum())} patients without a recorded age are dropped; "
+      f"{int(has_age.sum())} remain ({int(y.values[has_age].sum())} TNBC, {int((1 - y.values)[has_age].sum())} non-TNBC)")
+meta_age = meta.loc[has_age].copy()
+meta_age["AGE"] = ((age[has_age] - age[has_age].mean()) / age[has_age].std()).values
+counts_age = counts_f.loc[:, has_age].T.astype(int)
+
+def run_deseq(design):
+    """Fit DESeq2 on the patients with age and return the TNBC-vs-non-TNBC results table."""
+    d = DeseqDataSet(counts=counts_age, metadata=meta_age, design=design,
+                     refit_cooks=True, inference=inference, quiet=True)
+    d.deseq2()
+    s = DeseqStats(d, contrast=["group", "TNBC", "nonTNBC"], inference=inference, quiet=True)
+    s.summary()
+    r = s.results_df.copy()
+    r.index = r.index.astype(int)
+    return d, r
+
+t0 = time.time()
+dds_age, de_age = run_deseq("~AGE + group")          # age-adjusted
+_, de_same = run_deseq("~group")                     # unadjusted, same patients
+print(f"two extra DESeq2 fits finished in {time.time()-t0:.0f}s")
+
+# Age effect itself (natural-log LFC per SD of age -> log2 per 10 years)
+age_lfc = dds_age.varm["LFC"]["AGE"] / np.log(2) / age[has_age].std() * 10
+age_lfc.index = age_lfc.index.astype(int)            # DESeq2 stores gene IDs as text
+print(f"median |age effect| on repair genes: {age_lfc.reindex(counts_f.index).loc[repair_present].abs().median():.3f} "
+      f"log2 per 10 years (TNBC effect: {rep.log2FoldChange.abs().median():.3f})")
+
+cmp_age = pd.DataFrame({
+    "symbol": rep.symbol,
+    "lfc_original": rep.log2FoldChange,
+    "lfc_same_patients": de_same.loc[rep.index, "log2FoldChange"],
+    "lfc_age_adjusted": de_age.loc[rep.index, "log2FoldChange"],
+    "padj_age_adjusted": de_age.loc[rep.index, "padj"],
+})
+cmp_age["padj_repair_family_age"] = multipletests(de_age.loc[rep.index, "pvalue"], method="fdr_bh")[1]
+cmp_age["call_age_adjusted"] = [call(pd.Series({"padj_repair_family": p, "log2FoldChange": l}))
+                                for p, l in zip(cmp_age.padj_repair_family_age, cmp_age.lfc_age_adjusted)]
+cmp_age["call_original"] = rep["call"]
+cmp_age["change"] = cmp_age.lfc_age_adjusted - cmp_age.lfc_original
+
+r_p = stats.pearsonr(cmp_age.lfc_original, cmp_age.lfc_age_adjusted)[0]
+r_s = stats.spearmanr(cmp_age.lfc_original, cmp_age.lfc_age_adjusted)[0]
+r_sub = stats.pearsonr(cmp_age.lfc_same_patients, cmp_age.lfc_age_adjusted)[0]
+sig0 = rep.padj_repair_family < 0.05
+sig1 = cmp_age.padj_repair_family_age < 0.05
+print(f"\nRepair-gene log2FC, original vs age-adjusted: Pearson r = {r_p:.3f}, Spearman ρ = {r_s:.3f}")
+print(f"same patients without vs with age: Pearson r = {r_sub:.3f}")
+print(f"median |change| in log2FC: {cmp_age.change.abs().median():.3f}; largest: {cmp_age.change.abs().max():.3f} "
+      f"({cmp_age.loc[cmp_age.change.abs().idxmax(), 'symbol']})")
+print(f"significant (repair-family FDR < 0.05): {int(sig0.sum())} originally, {int(sig1.sum())} age-adjusted; "
+      f"same call for {(sig0 == sig1).mean():.0%} of genes; same direction for "
+      f"{(np.sign(cmp_age.lfc_original) == np.sign(cmp_age.lfc_age_adjusted)).mean():.0%}")
+print(f"up / down after age adjustment: {int((sig1 & (cmp_age.lfc_age_adjusted > 0)).sum())} / "
+      f"{int((sig1 & (cmp_age.lfc_age_adjusted < 0)).sum())} (originally {int((sig0 & (rep.log2FoldChange > 0)).sum())} / "
+      f"{int((sig0 & (rep.log2FoldChange < 0)).sum())})")
+TWOFOLD = ["UP ≥2x in TNBC", "DOWN ≥2x in TNBC"]
+print("≥2-fold calls, original:", ", ".join(cmp_age.symbol[cmp_age.call_original.isin(TWOFOLD)]))
+print("≥2-fold calls, age-adjusted:", ", ".join(cmp_age.symbol[cmp_age.call_age_adjusted.isin(TWOFOLD)]))
+changed = cmp_age[cmp_age.call_original != cmp_age.call_age_adjusted]
+print(f"\n{len(changed)} repair genes change their call after age adjustment:")
+display(changed[["symbol", "lfc_original", "lfc_age_adjusted", "call_original", "call_age_adjusted"]].round(3))
+print("Largest shifts in log2FC:")
+display(cmp_age.reindex(cmp_age.change.abs().sort_values(ascending=False).index).head(8)[
+    ["symbol", "lfc_original", "lfc_same_patients", "lfc_age_adjusted", "change"]].round(3))
+cmp_age.to_csv(os.path.join(RESULTS_DIR, "dna_repair_age_adjusted.csv"))
+
+fig, ax = plt.subplots(figsize=(6.5, 6))
+ax.scatter(cmp_age.lfc_original, cmp_age.lfc_age_adjusted, s=20, c=np.where(sig1, "#C0392B", "#AAB7B8"),
+           edgecolor="k", lw=0.3)
+lim = [cmp_age[["lfc_original", "lfc_age_adjusted"]].min().min() - 0.1,
+       cmp_age[["lfc_original", "lfc_age_adjusted"]].max().max() + 0.1]
+ax.plot(lim, lim, ls="--", c="grey", lw=0.8); ax.axhline(0, c="k", lw=0.6); ax.axvline(0, c="k", lw=0.6)
+for eid in cmp_age.change.abs().sort_values().index[-6:]:
+    ax.annotate(cmp_age.symbol[eid], (cmp_age.lfc_original[eid], cmp_age.lfc_age_adjusted[eid]),
+                fontsize=7, xytext=(3, 2), textcoords="offset points")
+ax.scatter([], [], c="#C0392B", s=20, label="FDR < 0.05 after age adjustment")
+ax.scatter([], [], c="#AAB7B8", s=20, label="not significant")
+ax.set(xlabel="log2FC, original model (~group)", ylabel="log2FC, age-adjusted model (~AGE + group)",
+       title=f"Repair-gene fold changes with and without age\nPearson r = {r_p:.3f}")
+ax.legend(fontsize=8, loc="upper left"); plt.tight_layout(); plt.show()
+
+# %% [markdown]
+# ### 5.6 Shrunken fold changes
+#
+# Raw DESeq2 fold changes are noisy for genes with low counts or high dispersion. `lfc_shrink()` (apeGLM prior) pulls those estimates towards zero while leaving well-measured genes almost unchanged. This makes the ranking by effect size more reliable. We use a separate `DeseqStats` object so the original results used later in the notebook stay untouched.
+
+# %%
+t0 = time.time()
+ds_shr = DeseqStats(dds, contrast=["group", "TNBC", "nonTNBC"], inference=inference, quiet=True)
+ds_shr.summary()
+# The design's reference level is "TNBC" (alphabetical), so the model coefficient is group[T.nonTNBC].
+# lfc_shrink() writes that raw coefficient into results_df, so we flip its sign back to TNBC vs non-TNBC.
+LFC_COEF = [c for c in dds.varm["LFC"].columns if c.startswith("group")][0]
+ds_shr.lfc_shrink(coeff=LFC_COEF)
+shr = ds_shr.results_df.copy()
+shr.index = shr.index.astype(int)
+if LFC_COEF.endswith("nonTNBC]"):
+    shr["log2FoldChange"] = -shr["log2FoldChange"]
+assert stats.spearmanr(shr.loc[rep.index, "log2FoldChange"], rep.log2FoldChange)[0] > 0.9, "shrunken LFC sign check failed"
+print(f"LFC shrinkage finished in {time.time()-t0:.0f}s")
+
+rep_shr = rep[["symbol", "pathways", "baseMean", "log2FoldChange", "lfcSE", "padj_repair_family", "call"]].copy()
+rep_shr["log2FC_shrunk"] = shr.loc[rep.index, "log2FoldChange"]
+rep_shr["lfcSE_shrunk"] = shr.loc[rep.index, "lfcSE"]
+rep_shr["shrink"] = rep_shr.log2FC_shrunk - rep_shr.log2FoldChange
+print(f"Repair genes, raw vs shrunken log2FC: Pearson r = {stats.pearsonr(rep_shr.log2FoldChange, rep_shr.log2FC_shrunk)[0]:.4f}; "
+      f"median |shrinkage| = {rep_shr.shrink.abs().median():.4f}; largest = {rep_shr.shrink.abs().max():.3f} "
+      f"({rep_shr.loc[rep_shr.shrink.abs().idxmax(), 'symbol']})")
+print(f"genes with |shrunken log2FC| ≥ 1 and repair-family FDR < 0.05: "
+      f"{int(((rep_shr.log2FC_shrunk.abs() >= 1) & (rep_shr.padj_repair_family < 0.05)).sum())} "
+      f"(raw: {int(rep_shr.call.isin(TWOFOLD).sum())})")
+print("\nRepair genes ranked by shrunken log2FC (top 12 up, top 5 down):")
+rep_shr = rep_shr.sort_values("log2FC_shrunk", ascending=False)
+display(rep_shr.head(12).round(3))
+display(rep_shr.tail(5).iloc[::-1].round(3))
+print("Genes most affected by shrinkage:")
+display(rep_shr.reindex(rep_shr.shrink.abs().sort_values(ascending=False).index).head(5).round(3))
+rep_shr.to_csv(os.path.join(RESULTS_DIR, "dna_repair_DE_shrunken.csv"))
+
+# %% [markdown]
+# **Interpretation (Stage 5).**
 #
 # * **Sanity:** the receptor genes come out as expected (*ESR1* log2FC −5.0, *PGR* −4.1, *ERBB2* −2.2), as do the basal markers (*FOXC1* +3.0, *KRT5* +2.5). So the contrast direction and the labels are correct.
 # * **Genome-wide:** 13,377 of 16,697 genes (80%) have FDR < 0.05. With 1,006 tumours almost everything is statistically "different", so effect sizes and gene-set comparisons matter more than p-values.
@@ -205,3 +335,5 @@ plt.tight_layout(); plt.show()
 #   * **Lower** than proliferation predicts (67 genes): led by ***BRCA1*** (−0.84 log2), then *POLN, POLD4, RAD50, EME2, ATRIP, MSH3*.
 #
 #   The adjusted estimate is the part of the TNBC difference that proliferation cannot explain. It is not the "true" effect: if TNBC biology drives both proliferation and repair expression, adjustment removes some real signal too.
+# * **Age (robustness check):** TNBC patients are younger, so we re-ran DESeq2 with age as a covariate (`~AGE + group`) on the 992 patients with a recorded age (14 dropped; 157 TNBC, 835 non-TNBC). The repair-gene fold changes are practically identical to the original ones (Pearson r = 1.000, Spearman ρ = 0.999). The median change is 0.009 log2 units and the largest is 0.072 (*NTHL1*, a gene with almost no TNBC effect). 115 instead of 116 repair genes stay significant (79 up, 36 down). Only *RAD51C* changes its call, from slightly down (log2FC −0.16) to not significant (−0.14). The same eleven genes change at least two-fold. Fitting `~group` on the same 992 patients gives the same fold changes too (r = 1.000), so neither dropping the patients without age nor adjusting for age changes anything. **The TNBC repair-gene differences are not an age effect.** The model only adjusts for a linear age trend, which is the usual assumption.
+# * **Shrunken fold changes:** apeGLM shrinkage hardly moves any repair-gene estimate (r = 1.0000 with the raw values; median shift 0.002, largest 0.012 for *POLN*). The ranking and the eleven ≥2-fold genes stay the same, led by *FANCA* (1.37), *RAD54L* (1.36) and *CHEK1* (1.28), with *POLN* (−1.14) the only one down. This is expected: with ~1,000 tumours and well-expressed genes the standard errors are small (lfcSE 0.06–0.10), so the prior has little to correct. The raw fold changes reported above can be trusted as effect sizes.

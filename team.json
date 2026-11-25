@@ -1,12 +1,12 @@
 {
   "_comment": "Who leads each stage. Edit names/usernames here if you swap roles; build_notebook.py writes the lead's name under each stage heading.",
   "members": {
-    "wanyoike": {"name": "Wanyoike Samuel Macharia", "github": "github-username"},
-    "arop":     {"name": "Arop Mary Abiong",         "github": "github-username"},
-    "dylan":    {"name": "Dylan Saisi",              "github": "github-username"},
+    "wanyoike": {"name": "Wanyoike Samuel Macharia", "github": "sammacharia21"},
+    "arop":     {"name": "Arop Mary Abiong",         "github": "abiongarop"},
+    "dylan":    {"name": "Dylan Saisi",              "github": "dylanchezz"},
     "pete":     {"name": "Pete Njagi",               "github": "github-username"},
     "danni":    {"name": "Danni Podho",              "github": "DanniPo"},
-    "kian":     {"name": "Kian Mwiberi",             "github": "github-username"}
+    "kian":     {"name": "Kian Mwiberi",             "github": "Mwiberikian"}
   },
   "stages": {
     "01_question_and_objectives":   "wanyoike",
