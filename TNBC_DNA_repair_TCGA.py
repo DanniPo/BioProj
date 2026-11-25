@@ -294,212 +294,1845 @@ except Exception as err:
 # %% [markdown]
 # **Interpretation (Stage 2).** All four files downloaded and matched their pinned SHA-256 hashes, so these are exactly the inputs we analysed. The expression matrix covers **40,796 genes in 1,097 TCGA-BRCA tumour samples** and contains all 156 DNA-repair genes. The receptor-status table covers 1,097 patients. So the data can answer our question: it holds both the grouping variable (ER/PR/HER2) and genome-wide expression for the same patients. One weakness is visible already. Receptor status was scored by pathologists at many hospitals over several years, so some label noise is expected; we check this in Stage 3. When run in Colab, the GDC check listed 1,111 primary-tumour STAR-count files for 1,095 TCGA-BRCA patients, and all 1,090 distinct patients in our matrix (1,097 sample columns) were in that listing. That confirms the mirror really carries GDC data; five GDC patients are not in our matrix.
 
+# ---
+# jupyter:
+#   jupytext:
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
+
 # %% [markdown]
 # ## Stage 3 · Preprocessing and quality control
 #
 # *Stage lead: Arop Mary Abiong*
+#
+# This stage performs:
+# 1. Count-matrix integrity checks.
+# 2. Primary tumour selection and TNBC classification.
+# 3. Sequencing-depth quality control.
+# 4. Low-expression gene filtering.
+# 5. Filtering sensitivity analysis.
+# 6. Count normalisation.
+# 7. Biological sanity checks.
+# 8. ESR1-discordant TNBC investigation.
+
+# %%
+# ============================================================
+# 3.0 IMPORTS AND INPUT VALIDATION
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy import stats
+from IPython.display import display
+
+required_objects = [
+    "counts_raw",
+    "bcr",
+    "gdc_patient",
+    "repair",
+    "MARKERS",
+    "PROLIF",
+    "GROUP_COLORS",
+    "SEED"
+]
+
+missing_objects = [
+    name for name in required_objects
+    if name not in globals()
+]
+
+if missing_objects:
+    raise NameError(
+        "Stage 3 is missing outputs from earlier stages: "
+        + ", ".join(missing_objects)
+        + ". Run the earlier stages before Stage 3."
+    )
+
+for name, obj in [
+    ("counts_raw", counts_raw),
+    ("bcr", bcr),
+    ("gdc_patient", gdc_patient),
+    ("repair", repair)
+]:
+    if not isinstance(obj, pd.DataFrame):
+        raise TypeError(f"{name} must be a pandas DataFrame.")
+
+if counts_raw.empty:
+    raise ValueError("The raw count matrix is empty.")
+
+if "symbol" not in repair.columns:
+    raise KeyError(
+        "The repair DataFrame must contain a 'symbol' column."
+    )
+
+print("Stage 3 inputs successfully loaded.")
+print("Raw count matrix shape:", counts_raw.shape)
+
 
 # %% [markdown]
 # ### 3.1 Integrity of the count matrix
+#
+# Check missing values, negative values, non-integer counts
+# and duplicated gene or sample identifiers.
+#
+# Duplicated gene IDs are combined by summing their counts.
+# To reduce memory use, only duplicated rows are grouped.
 
 # %%
-print("missing values      :", int(counts_raw.isna().sum().sum()))
-print("negative counts     :", int((counts_raw < 0).sum().sum()))
-print("non-integer counts  :", int((counts_raw % 1 != 0).sum().sum()))
-dup_genes = counts_raw.index.duplicated(keep=False)
-print("duplicated gene IDs :", counts_raw.index[dup_genes].nunique(), "IDs appear on", int(dup_genes.sum()), "rows")
-print("duplicated samples  :", int(counts_raw.columns.duplicated().sum()))
+# ============================================================
+# 3.1 COUNT MATRIX INTEGRITY
+# ============================================================
 
-# Some Entrez IDs map to more than one GENCODE gene (e.g. X/Y pseudo-autosomal copies).
-# Reads from those rows belong to the same Entrez gene, so we sum them.
-counts_all = counts_raw.groupby(level=0).sum()
-print("genes after merging duplicated IDs:", counts_all.shape[0])
+print("COUNT MATRIX INTEGRITY")
+print("=" * 45)
+
+counts_raw = counts_raw.copy()
+counts_raw.columns = counts_raw.columns.astype(str)
+
+# Check that the matrix contains numeric values.
+
+if not all(
+    pd.api.types.is_numeric_dtype(dtype)
+    for dtype in counts_raw.dtypes
+):
+    raise TypeError(
+        "The count matrix contains non-numeric columns."
+    )
+
+# Check count values.
+
+missing_values = int(
+    counts_raw.isna().to_numpy().sum()
+)
+
+if missing_values > 0:
+    raise ValueError(
+        f"The count matrix contains {missing_values:,} missing values."
+    )
+
+negative_counts = int(
+    (counts_raw < 0).to_numpy().sum()
+)
+
+if negative_counts > 0:
+    raise ValueError(
+        f"The count matrix contains {negative_counts:,} negative values."
+    )
+
+non_integer_counts = int(
+    (counts_raw % 1 != 0).to_numpy().sum()
+)
+
+if non_integer_counts > 0:
+    raise ValueError(
+        f"The count matrix contains {non_integer_counts:,} non-integer values."
+    )
+
+duplicate_sample_columns = int(
+    counts_raw.columns.duplicated().sum()
+)
+
+if duplicate_sample_columns > 0:
+    raise ValueError(
+        "The count matrix contains duplicated sample columns."
+    )
+
+duplicate_mask = counts_raw.index.duplicated(keep=False)
+
+duplicate_gene_ids = int(
+    counts_raw.index[duplicate_mask].nunique()
+)
+
+duplicate_gene_rows = int(
+    duplicate_mask.sum()
+)
+
+print("Missing values:", missing_values)
+print("Negative counts:", negative_counts)
+print("Non-integer counts:", non_integer_counts)
+print("Duplicated gene IDs:", duplicate_gene_ids)
+print("Rows belonging to duplicated gene IDs:", duplicate_gene_rows)
+print("Duplicated sample columns:", duplicate_sample_columns)
+
+# Use int32 where possible to reduce memory consumption.
+# Fall back to int64 if the raw counts are too large.
+
+maximum_count = int(counts_raw.to_numpy().max())
+
+if maximum_count <= np.iinfo(np.int32).max:
+    counts_raw = counts_raw.astype(np.int32)
+    print("Count storage: int32 (memory-efficient)")
+else:
+    counts_raw = counts_raw.astype(np.int64)
+    print("Count storage: int64")
+
+# Aggregate only duplicated gene IDs.
+
+if duplicate_gene_rows > 0:
+
+    # Keep the rows with unique gene IDs.
+    counts_unique = counts_raw.loc[
+        ~duplicate_mask
+    ]
+
+    # Select only duplicated rows.
+    counts_duplicates = counts_raw.loc[
+        duplicate_mask
+    ].astype(np.int64)
+
+    # Sum the duplicated gene IDs.
+    counts_duplicates_aggregated = (
+        counts_duplicates
+        .groupby(level=0, sort=False)
+        .sum()
+    )
+
+    if (
+        counts_duplicates_aggregated.to_numpy().max()
+        > np.iinfo(np.int32).max
+        and counts_raw.dtypes.iloc[0] == np.dtype("int32")
+    ):
+        raise OverflowError(
+            "Aggregated counts exceed the int32 limit. "
+            "Use int64 for the count matrix."
+        )
+
+    counts_duplicates_aggregated = (
+        counts_duplicates_aggregated
+        .astype(counts_raw.dtypes.iloc[0])
+    )
+
+    # Combine unique and aggregated rows.
+    counts_all = pd.concat([
+        counts_unique,
+        counts_duplicates_aggregated
+    ])
+
+else:
+    counts_all = counts_raw
+
+# Sort the final gene index.
+counts_all = counts_all.sort_index()
+
+if counts_all.index.has_duplicates:
+    raise ValueError(
+        "Duplicate gene IDs remain after aggregation."
+    )
+
+print("\nDuplicate gene IDs aggregated successfully.")
+print("Updated count matrix shape:", counts_all.shape)
+print("Remaining duplicated gene IDs:", counts_all.index.duplicated().sum())
+print("Unique genes:", f"{counts_all.shape[0]:,}")
+print("Samples:", f"{counts_all.shape[1]:,}")
+
 
 # %% [markdown]
-# ### 3.2 Sample selection and TNBC labels
+# ### 3.2 Sample selection and TNBC classification
 #
-# * Keep **primary tumours** only (barcode type `01`) and one sample per patient.
-# * **HER2:** positive if IHC is 3+/positive **or** FISH shows amplification. Negative if FISH is negative, or IHC is negative with no positive FISH. Otherwise (e.g. IHC equivocal with no FISH) it is *unknown*.
-# * **TNBC** = ER-negative **and** PR-negative **and** HER2-negative. **non-TNBC** = ER-, PR- or HER2-positive. Anything else (a negative receptor with missing or indeterminate partners) is *unknown* and excluded.
-# * **Male patients are excluded**, because male breast cancer is biologically different and too rare (n = 12) to model.
+# Selection criteria:
+# - Retain primary tumours only (TCGA sample type 01).
+# - Retain one sample per patient.
+# - Determine HER2 status using IHC and FISH.
+# - Classify TNBC as ER-negative, PR-negative and HER2-negative.
+# - Classify non-TNBC when at least one receptor is positive.
+# - Exclude unknown receptor status.
+# - Retain female patients in the final cohort.
 
 # %%
+# ============================================================
+# 3.2 SAMPLE SELECTION AND TNBC CLASSIFICATION
+# ============================================================
+
+required_bcr_columns = [
+    "PATIENT_ID",
+    "ER_STATUS_BY_IHC",
+    "PR_STATUS_BY_IHC",
+    "IHC_HER2",
+    "HER2_FISH_STATUS"
+]
+
+missing_bcr_columns = [
+    col for col in required_bcr_columns
+    if col not in bcr.columns
+]
+
+if missing_bcr_columns:
+    raise KeyError(
+        "Missing columns in BCR clinical data: "
+        + ", ".join(missing_bcr_columns)
+    )
+
+required_gdc_columns = [
+    "PATIENT_ID",
+    "SEX",
+    "AGE",
+    "RACE"
+]
+
+missing_gdc_columns = [
+    col for col in required_gdc_columns
+    if col not in gdc_patient.columns
+]
+
+if missing_gdc_columns:
+    raise KeyError(
+        "Missing columns in GDC patient data: "
+        + ", ".join(missing_gdc_columns)
+    )
+
+
+# Standardise clinical text values.
+
+def clean_status(value):
+    if pd.isna(value):
+        return "Unknown"
+
+    value = str(value).strip().lower()
+
+    if value in ["positive", "pos", "1", "yes"]:
+        return "Positive"
+
+    if value in ["negative", "neg", "0", "no"]:
+        return "Negative"
+
+    return "Unknown"
+
+
 def her2_status(row):
-    ihc, fish = row["IHC_HER2"], row["HER2_FISH_STATUS"]
+
+    ihc = clean_status(row["IHC_HER2"])
+    fish = clean_status(row["HER2_FISH_STATUS"])
+
+    # A positive result from either test indicates HER2-positive.
     if ihc == "Positive" or fish == "Positive":
         return "Positive"
-    if fish == "Negative" or ihc == "Negative":
+
+    # If one test is negative and the other is unknown,
+    # retain the available negative result.
+    if ihc == "Negative" or fish == "Negative":
         return "Negative"
+
     return "Unknown"
+
 
 def tnbc_group(row):
-    if "Positive" in (row["ER"], row["PR"], row["HER2"]):
+
+    receptors = (
+        row["ER"],
+        row["PR"],
+        row["HER2"]
+    )
+
+    if "Positive" in receptors:
         return "non-TNBC"
-    if row["ER"] == "Negative" and row["PR"] == "Negative" and row["HER2"] == "Negative":
+
+    if all(value == "Negative" for value in receptors):
         return "TNBC"
+
     return "Unknown"
 
-clin = bcr.set_index("PATIENT_ID")
-labels = pd.DataFrame({"ER": clin["ER_STATUS_BY_IHC"], "PR": clin["PR_STATUS_BY_IHC"]})
-labels["HER2"] = clin.apply(her2_status, axis=1)
-labels["group"] = labels.apply(tnbc_group, axis=1)
-gp = gdc_patient.set_index("PATIENT_ID")
-labels = labels.join(gp[["SEX", "AGE", "RACE"]], how="left")
+
+# Prepare BCR clinical information.
+
+clin = bcr.copy()
+
+clin["PATIENT_ID"] = clin["PATIENT_ID"].astype(str).str.strip()
+clin = clin.set_index("PATIENT_ID")
+
+if clin.index.has_duplicates:
+    raise ValueError(
+        "The BCR clinical table contains duplicated patient IDs. "
+        "Resolve these before continuing."
+    )
+
+labels = pd.DataFrame(index=clin.index)
+
+labels["ER"] = clin["ER_STATUS_BY_IHC"].apply(clean_status)
+labels["PR"] = clin["PR_STATUS_BY_IHC"].apply(clean_status)
+
+labels["HER2"] = clin.apply(
+    her2_status,
+    axis=1
+)
+
+labels["group"] = labels.apply(
+    tnbc_group,
+    axis=1
+)
+
+
+# Prepare GDC demographic information.
+
+
+gp = gdc_patient.copy()
+
+gp["PATIENT_ID"] = gp["PATIENT_ID"].astype(str).str.strip()
+
+gp["SEX"] = (
+    gp["SEX"]
+    .astype("string")
+    .str.strip()
+    .str.capitalize()
+)
+
+gp = gp.set_index("PATIENT_ID")
+
+
+if gp.index.has_duplicates:
+    raise ValueError(
+        "The GDC patient table contains duplicated patient IDs."
+    )
+
+# Join demographic information to receptor information.
+labels = labels.join(
+    gp[["SEX", "AGE", "RACE"]],
+    how="left"
+)
+
+# Standardise recorded sex.
+labels["SEX"] = (
+    labels["SEX"]
+    .astype("string")
+    .str.strip()
+    .str.capitalize()
+)
+
+
+# Record cohort filtering steps.
 
 flow = []
+
+
 def log_step(step, n_samples, n_patients=None):
-    flow.append({"step": step, "samples": n_samples, "patients": n_patients if n_patients is not None else n_samples})
 
-log_step("All samples in count matrix", counts_all.shape[1], counts_all.columns.str[:12].nunique())
+    flow.append({
+        "step": step,
+        "samples": int(n_samples),
+        "patients": int(
+            n_patients if n_patients is not None else n_samples
+        )
+    })
+
+
+# All samples.
+
+all_patient_ids = counts_all.columns.str[:12]
+
+log_step(
+    "All samples in count matrix",
+    counts_all.shape[1],
+    all_patient_ids.nunique()
+)
+
+
+# Select primary tumours.
+
+if not all(
+    len(sample) >= 15
+    for sample in counts_all.columns
+):
+    raise ValueError(
+        "Some sample barcodes are too short to identify "
+        "their TCGA sample type."
+    )
+
 sample_type = counts_all.columns.str[13:15]
-print("sample-type codes:", pd.Series(sample_type).value_counts().to_dict(), "(01 = primary tumour, 06 = metastasis)")
-counts_pt = counts_all.loc[:, sample_type == "01"]
-log_step("Primary tumours (type 01)", counts_pt.shape[1], counts_pt.columns.str[:12].nunique())
-assert counts_pt.columns.str[:12].is_unique, "more than one primary tumour per patient"
-counts_pt.columns = counts_pt.columns.str[:12]          # one sample per patient -> use patient ID
 
-has_status = counts_pt.columns.intersection(labels.index)
-log_step("With receptor-status record", len(has_status))
-known = [p for p in has_status if labels.loc[p, "group"] != "Unknown"]
-log_step("TNBC status determinable", len(known))
-female = [p for p in known if labels.loc[p, "SEX"] == "Female"]
-log_step("Female patients (final cohort)", len(female))
+print(
+    "\nSample-type codes:",
+    pd.Series(sample_type).value_counts().to_dict()
+)
 
-display(pd.DataFrame(flow).set_index("step"))
-print("\nreceptor-status combinations among patients with RNA-seq:")
-display(pd.crosstab([labels.loc[has_status, "ER"], labels.loc[has_status, "PR"]], labels.loc[has_status, "HER2"]))
+counts_pt = counts_all.loc[
+    :,
+    sample_type == "01"
+].copy()
 
-# %%
+log_step(
+    "Primary tumours (type 01)",
+    counts_pt.shape[1],
+    counts_pt.columns.str[:12].nunique()
+)
+
+if counts_pt.empty:
+    raise ValueError(
+        "No primary tumour samples were found."
+    )
+
+
+# Retain one sample per patient.
+
+patient_ids = counts_pt.columns.str[:12]
+
+if patient_ids.has_duplicates:
+    duplicated_patients = (
+        patient_ids[patient_ids.duplicated()]
+        .unique()
+        .tolist()
+    )
+
+    raise ValueError(
+        "Multiple primary tumour samples were found for "
+        f"some patients: {duplicated_patients[:10]}"
+    )
+
+counts_pt.columns = patient_ids
+
+
+# Match RNA-seq samples to clinical records.
+
+has_status = counts_pt.columns.intersection(
+    labels.index
+)
+
+log_step(
+    "With receptor-status record",
+    len(has_status)
+)
+
+known = [
+    patient
+    for patient in has_status
+    if labels.loc[patient, "group"] != "Unknown"
+]
+
+log_step(
+    "TNBC status determinable",
+    len(known)
+)
+
+
+# Retain female patients.
+
+female = [
+    patient
+    for patient in known
+    if labels.loc[patient, "SEX"] == "Female"
+]
+
+log_step(
+    "Female patients (final cohort)",
+    len(female)
+)
+
+
+# Display filtering flow.
+
+print("\nCOHORT FILTERING FLOW")
+
+display(
+    pd.DataFrame(flow).set_index("step")
+)
+
+
+# Display receptor combinations.
+
+print("\nRECEPTOR-STATUS COMBINATIONS")
+
+display(
+    pd.crosstab(
+        [
+            labels.loc[has_status, "ER"],
+            labels.loc[has_status, "PR"]
+        ],
+        labels.loc[has_status, "HER2"]
+    )
+)
+
+
+# Define final cohort.
+
+if len(female) == 0:
+    raise ValueError(
+        "No female patients with known receptor status were found."
+    )
+
 cohort = labels.loc[female].copy()
-counts = counts_pt[female]
-y = (cohort["group"] == "TNBC").astype(int)
-print(cohort["group"].value_counts().to_string())
+counts = counts_pt[female].copy()
+
+y = (
+    cohort["group"] == "TNBC"
+).astype(int)
+
+print("\nFINAL COHORT COMPOSITION")
+
+display(
+    cohort["group"].value_counts().to_frame("Patients")
+)
+
+print(f"Final cohort size: {len(cohort):,}")
 print(f"TNBC fraction: {y.mean():.1%}")
+
 
 # %% [markdown]
 # ### 3.3 Library size and detected genes per sample
+#
+# Examine sequencing depth and the number of detected genes.
+# Samples with unusually small libraries are flagged for review.
+# They are not automatically removed.
 
 # %%
+# ============================================================
+# 3.3 LIBRARY SIZE AND DETECTED GENES
+# ============================================================
+
 lib_size = counts.sum(axis=0)
 detected = (counts > 0).sum(axis=0)
-log_lib = np.log10(lib_size)
-mad = stats.median_abs_deviation(log_lib)
-low_lib = log_lib < (log_lib.median() - 4 * mad)
-print(f"library size: median {lib_size.median()/1e6:.1f} M reads (range {lib_size.min()/1e6:.1f}–{lib_size.max()/1e6:.1f} M)")
-print(f"detected genes: median {detected.median():,.0f} (range {detected.min():,}–{detected.max():,})")
-print(f"samples more than 4 MADs below the median log-library size: {int(low_lib.sum())} "
-      f"(smallest library {lib_size.min()/1e6:.1f} M reads)")
-print("library size by group (M reads):")
-display((lib_size / 1e6).groupby(cohort["group"]).describe().round(1))
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for g, col in GROUP_COLORS.items():
-    axes[0].hist(lib_size[cohort["group"] == g] / 1e6, bins=40, alpha=0.6, color=col, label=g)
-axes[0].set(xlabel="library size (million reads)", ylabel="samples", title="Library size per sample")
+if (lib_size <= 0).any():
+    bad_samples = lib_size.index[
+        lib_size <= 0
+    ].tolist()
+
+    raise ValueError(
+        "Samples with zero or negative library size: "
+        f"{bad_samples[:10]}"
+    )
+
+log_lib = np.log10(lib_size.astype(float))
+
+mad = stats.median_abs_deviation(
+    log_lib,
+    scale=1
+)
+
+if mad == 0:
+    low_lib = pd.Series(False, index=log_lib.index)
+else:
+    low_lib = log_lib < (
+        log_lib.median() - 4 * mad
+    )
+
+print(
+    f"Library size: median {lib_size.median()/1e6:.1f} million reads"
+)
+
+print(
+    f"Library size range: "
+    f"{lib_size.min()/1e6:.1f}–{lib_size.max()/1e6:.1f} million reads"
+)
+
+print(
+    f"Detected genes: median {detected.median():,.0f}"
+)
+
+print(
+    f"Detected genes range: {detected.min():,}–{detected.max():,}"
+)
+
+print("Samples flagged for low library size:", int(low_lib.sum()))
+
+
+# Library size by TNBC group.
+
+print("\nLIBRARY SIZE BY GROUP (MILLION READS)")
+
+display(
+    (lib_size / 1e6)
+    .groupby(cohort["group"])
+    .describe()
+    .round(2)
+)
+
+
+# Plot library size and detected genes.
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(12, 4)
+)
+
+for group, color in GROUP_COLORS.items():
+
+    group_mask = cohort["group"] == group
+
+    axes[0].hist(
+        lib_size[group_mask] / 1e6,
+        bins=40,
+        alpha=0.6,
+        color=color,
+        label=group
+    )
+
+axes[0].set(
+    xlabel="Library size (million reads)",
+    ylabel="Samples",
+    title="Library size per sample"
+)
+
 axes[0].legend()
-axes[1].scatter(lib_size / 1e6, detected, s=8, c=cohort["group"].map(GROUP_COLORS))
-axes[1].set(xlabel="library size (million reads)", ylabel="genes with ≥1 read", title="Detected genes vs depth")
-plt.tight_layout(); plt.show()
+
+axes[1].scatter(
+    lib_size / 1e6,
+    detected,
+    s=8,
+    c=cohort["group"].map(GROUP_COLORS)
+)
+
+axes[1].set(
+    xlabel="Library size (million reads)",
+    ylabel="Genes with at least one read",
+    title="Detected genes vs sequencing depth"
+)
+
+plt.tight_layout()
+plt.show()
+
 
 # %% [markdown]
 # ### 3.4 Filtering low-expressed genes
-# A gene is kept if it has at least 1 count per million (CPM) in at least 15% of samples (≈ the size of the TNBC group). Genes below this are mostly noise and cannot be tested reliably.
+#
+# Retain a gene if it has at least 1 count per million (CPM)
+# in at least 15% of the samples.
+#
+# The CPM matrix is stored as float32 to reduce memory use.
 
 # %%
-cpm = counts / lib_size * 1e6
-keep_gene = (cpm >= 1).sum(axis=1) >= 0.15 * counts.shape[1]
-counts_f = counts.loc[keep_gene]
-print(f"genes before filter: {counts.shape[0]:,}  after: {counts_f.shape[0]:,}")
-repair_present = repair.index[repair.index.isin(counts_f.index)]
-repair_dropped = repair.index.difference(repair_present)
-print(f"DNA-repair genes kept: {len(repair_present)} of {len(repair)}; dropped (not expressed in breast tumours):",
-      ", ".join(repair.loc[repair_dropped, "symbol"]))
+# ============================================================
+# 3.4 LOW-EXPRESSION GENE FILTERING
+# ============================================================
+
+# Calculate CPM using float32 to reduce memory requirements.
+
+counts_float = counts.astype(np.float32)
+
+lib_size_float = lib_size.astype(np.float32)
+
+cpm = counts_float.div(
+    lib_size_float,
+    axis=1
+) * np.float32(1e6)
+
+baseline_threshold = 0.15
+
+minimum_samples = int(
+    np.ceil(baseline_threshold * counts.shape[1])
+)
+
+keep_gene = (
+    (cpm >= 1).sum(axis=1)
+    >= minimum_samples
+)
+
+counts_f = counts.loc[keep_gene].copy()
+
+print(f"Genes before filtering: {counts.shape[0]:,}")
+print(f"Genes after filtering: {counts_f.shape[0]:,}")
+print(f"Genes removed: {counts.shape[0] - counts_f.shape[0]:,}")
+print(f"Minimum samples required: {minimum_samples:,}")
+
+
+# Check retained DNA-repair genes.
+
+repair_ids = repair.index
+
+repair_present = repair_ids.intersection(
+    counts_f.index
+)
+
+repair_dropped = repair_ids.difference(
+    repair_present
+)
+
+print(
+    f"\nDNA-repair genes retained: "
+    f"{len(repair_present)} of {len(repair)}"
+)
+
+if len(repair_dropped) > 0:
+
+    dropped_symbols = (
+        repair.loc[repair_dropped, "symbol"]
+        .astype(str)
+        .tolist()
+    )
+
+    print(
+        "DNA-repair genes not retained:",
+        ", ".join(dropped_symbols)
+    )
+
+else:
+    print("All DNA-repair genes were retained.")
+
+
+# %% [markdown]
+# ### 3.4.1 Sensitivity analysis of gene filtering
+#
+# Compare 10%, 15% and 25% sample-prevalence thresholds.
+# The 15% threshold remains the baseline.
+
+# %%
+# ============================================================
+# 3.4.1 FILTERING SENSITIVITY ANALYSIS
+# ============================================================
+
+def calculate_filter_sensitivity(
+    cpm_matrix,
+    repair_gene_ids,
+    sample_count,
+    thresholds=(0.10, 0.15, 0.25),
+    cpm_cutoff=1
+):
+    """
+    Compare gene retention at different sample-prevalence
+    thresholds without overwriting variables used by later stages.
+    """
+
+    sensitivity_rows = []
+
+    repair_id_set = {
+        str(gene_id) for gene_id in repair_gene_ids
+    }
+
+    # Calculate the number of samples expressing each gene.
+    expressed_sample_counts = (
+        cpm_matrix.ge(cpm_cutoff).sum(axis=1)
+    )
+
+    for prevalence_threshold in thresholds:
+
+        required_sample_count = int(
+            np.ceil(prevalence_threshold * sample_count)
+        )
+
+        threshold_keep_mask = (
+            expressed_sample_counts >= required_sample_count
+        )
+
+        threshold_retained_genes = (
+            cpm_matrix.index[threshold_keep_mask]
+        )
+
+        threshold_repair_genes = sum(
+            str(gene_id) in repair_id_set
+            for gene_id in threshold_retained_genes
+        )
+
+        sensitivity_rows.append({
+            "Threshold": f"{prevalence_threshold:.0%}",
+            "Minimum samples required": required_sample_count,
+            "Total genes retained": int(threshold_keep_mask.sum()),
+            "DNA repair genes retained": int(threshold_repair_genes)
+        })
+
+    return pd.DataFrame(sensitivity_rows)
+
+
+# Run sensitivity analysis using independent function variables.
+sensitivity_df = calculate_filter_sensitivity(
+    cpm_matrix=cpm,
+    repair_gene_ids=repair.index,
+    sample_count=counts.shape[1]
+)
+
+print("GENE-FILTERING SENSITIVITY ANALYSIS")
+display(sensitivity_df)
+
+
+# Compare alternative thresholds with the 15% baseline.
+baseline_row = sensitivity_df.loc[
+    sensitivity_df["Threshold"] == "15%"
+].iloc[0]
+
+baseline_genes = int(
+    baseline_row["Total genes retained"]
+)
+
+baseline_repair = int(
+    baseline_row["DNA repair genes retained"]
+)
+
+print("\nDIFFERENCE COMPARED WITH 15% BASELINE")
+
+for _, sensitivity_row in sensitivity_df.iterrows():
+
+    print(
+        f"{sensitivity_row['Threshold']}: "
+        f"{int(sensitivity_row['Total genes retained']) - baseline_genes:+,} "
+        "total genes; "
+        f"{int(sensitivity_row['DNA repair genes retained']) - baseline_repair:+} "
+        "DNA-repair genes"
+    )
+
+
 
 # %% [markdown]
 # ### 3.5 Normalisation
-# We use DESeq2's **median-of-ratios** size factors (the same method PyDESeq2 uses in Stage 5) and then `log2(normalised count + 1)`. This removes differences in sequencing depth and compresses the range, so samples can be compared in plots, PCA and machine learning.
+#
+# Use a positive-count median-of-ratios approach.
+#
+# For each gene, calculate its geometric mean using positive
+# counts. Calculate ratios for positive observations, then
+# take the median ratio for each sample.
+#
+# Size factors are scaled to have a geometric mean of 1.
 
 # %%
+# ============================================================
+# 3.5 MEDIAN-OF-RATIOS NORMALISATION
+# ============================================================
+
 def median_of_ratios(cnt):
-    log_c = np.log(cnt.replace(0, np.nan))
-    log_geo_mean = log_c.mean(axis=1)
-    usable = log_c.notna().all(axis=1)
-    return np.exp((log_c.loc[usable].sub(log_geo_mean[usable], axis=0)).median(axis=0))
+
+    if cnt.empty:
+        raise ValueError(
+            "Cannot normalise an empty count matrix."
+        )
+
+    if (cnt < 0).to_numpy().any():
+        raise ValueError(
+            "Negative counts found during normalisation."
+        )
+
+    # Convert to float64 for numerical stability.
+    values = cnt.astype(np.float64)
+
+    # Replace zeros with NaN for geometric mean calculation.
+    log_counts = np.log(
+        values.where(values > 0)
+    )
+
+    # Calculate geometric means from positive observations.
+    log_geo_mean = log_counts.mean(
+        axis=1,
+        skipna=True
+    )
+
+    geo_means = np.exp(log_geo_mean)
+
+    usable = (
+        geo_means.notna()
+        & np.isfinite(geo_means)
+        & (geo_means > 0)
+    )
+
+    print(
+        "Genes usable for normalisation:",
+        int(usable.sum())
+    )
+
+    if not usable.any():
+        raise ValueError(
+            "No genes are usable for median-of-ratios normalisation."
+        )
+
+    # Calculate ratios only where counts are positive.
+    ratios = (
+        values.loc[usable]
+        .where(values.loc[usable] > 0)
+        .div(geo_means.loc[usable], axis=0)
+    )
+
+    ratios = ratios.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    # Calculate the median ratio for each sample.
+    factors = ratios.median(
+        axis=0,
+        skipna=True
+    )
+
+    if factors.isna().any():
+        bad = factors.index[
+            factors.isna()
+        ].tolist()
+
+        raise ValueError(
+            "Size factors could not be calculated for samples: "
+            f"{bad[:10]}"
+        )
+
+    if (factors <= 0).any():
+        raise ValueError(
+            "Non-positive size factors were calculated."
+        )
+
+    # Scale factors to geometric mean 1.
+    factors = factors / np.exp(
+        np.log(factors).mean()
+    )
+
+    return factors
+
+
+# Calculate size factors using the filtered count matrix.
 
 size_factors = median_of_ratios(counts_f)
-logn = np.log2(counts_f / size_factors + 1)            # genes x samples
-print(f"size factors: median {size_factors.median():.2f}, range {size_factors.min():.2f}–{size_factors.max():.2f}")
-print("correlation of size factor with library size:", round(np.corrcoef(size_factors, lib_size)[0, 1], 3))
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+# Normalise the 15%-filtered count matrix, not the unfiltered matrix.
+normalised_counts = counts_f.astype(np.float64).div(
+    size_factors, axis=1
+)
+
+logn = np.log2(normalised_counts + 1)
+
+
+# Confirm that filtered counts and normalised expression
+# contain exactly the same genes and samples.
+
+assert counts_f.index.equals(logn.index), (
+    "Gene mismatch: counts_f and logn have different gene indexes."
+)
+
+assert counts_f.columns.equals(logn.columns), (
+    "Sample mismatch: counts_f and logn have different sample columns."
+)
+
+assert counts_f.shape == logn.shape, (
+    "Shape mismatch between filtered counts and log-normalised counts."
+)
+
+print("\nNormalisation alignment check passed.")
+print("Filtered counts shape:", counts_f.shape)
+print("Log-normalised expression shape:", logn.shape)
+
+
+sf_lib_correlation = np.corrcoef(
+    size_factors.to_numpy(),
+    lib_size.to_numpy()
+)[0, 1]
+
+print(
+    f"\nMedian size factor: {size_factors.median():.3f}"
+)
+
+print(
+    f"Size factor range: "
+    f"{size_factors.min():.3f}–{size_factors.max():.3f}"
+)
+
+print(
+    "Correlation of size factors with library size:",
+    round(sf_lib_correlation, 3)
+)
+
+
+# Plot expression distributions before and after normalisation.
+# Use a sample of genes to reduce plotting memory requirements.
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(12, 4)
+)
+
 rng = np.random.default_rng(SEED)
-for s in rng.choice(logn.columns, 60, replace=False):
-    sns.kdeplot(np.log2(counts_f[s] + 1), ax=axes[0], lw=0.6, color="grey", alpha=0.5)
-    sns.kdeplot(logn[s], ax=axes[1], lw=0.6, color="teal", alpha=0.5)
-axes[0].set(title="Before normalisation: log2(count+1)", xlabel="log2 expression")
-axes[1].set(title="After median-of-ratios normalisation", xlabel="log2 normalised expression")
-plt.tight_layout(); plt.show()
+
+number_to_plot = min(
+    30,
+    len(logn.columns)
+)
+
+selected_samples = rng.choice(
+    logn.columns.to_numpy(),
+    number_to_plot,
+    replace=False
+)
+
+for sample in selected_samples:
+
+    sns.kdeplot(
+        np.log2(counts[sample].to_numpy(dtype=np.float32) + 1),
+        ax=axes[0],
+        lw=0.6,
+        color="grey",
+        alpha=0.5
+    )
+
+    sns.kdeplot(
+        logn[sample].to_numpy(dtype=np.float32),
+        ax=axes[1],
+        lw=0.6,
+        color="teal",
+        alpha=0.5
+    )
+
+axes[0].set(
+    title="Before normalisation",
+    xlabel="log2(count + 1)"
+)
+
+axes[1].set(
+    title="After median-of-ratios normalisation",
+    xlabel="log2(normalised count + 1)"
+)
+
+plt.tight_layout()
+plt.show()
+
 
 # %% [markdown]
 # ### 3.6 Biological sanity checks
-# Some biology must hold if the labels and expression data are matched correctly:
 #
-# * *ESR1* mRNA should be much lower in ER-negative tumours, *PGR* lower in PR-negative tumours, and *ERBB2* higher in HER2-positive tumours.
-# * Y-chromosome genes (*RPS4Y1, DDX3Y, KDM5D*) should be essentially silent in female patients. The 12 male patients excluded above serve as a positive control.
+# Examine whether gene expression agrees with clinical labels.
+#
+# Expected relationships:
+# - ESR1 expression should generally be higher in ER-positive tumours.
+# - PGR expression should generally be higher in PR-positive tumours.
+# - ERBB2 expression should generally be higher in HER2-positive tumours.
+# - Y-chromosome genes should generally be higher in male samples.
 
 # %%
+# ============================================================
+# 3.6 BIOLOGICAL SANITY CHECKS
+# ============================================================
+
+# Build a gene-symbol-to-Entrez-ID dictionary.
+
+symbol_to_id = {}
+
+symbol_to_id.update(MARKERS)
+symbol_to_id.update(PROLIF)
+
+repair_mapping = {
+    str(symbol): entrez_id
+    for entrez_id, symbol in repair["symbol"].items()
+    if pd.notna(symbol)
+}
+
+symbol_to_id.update(repair_mapping)
+
+
+# Map string gene IDs to their actual index values.
+# This handles cases where one table uses strings and
+# another uses integers for Entrez Gene IDs.
+
+index_lookup = {
+    str(gene_id): gene_id
+    for gene_id in logn.index
+}
+
+
+def resolve_gene_id(symbol_or_id):
+
+    if symbol_or_id in symbol_to_id:
+        gene_id = symbol_to_id[symbol_or_id]
+    else:
+        gene_id = symbol_or_id
+
+    return index_lookup.get(
+        str(gene_id),
+        None
+    )
+
+
 def gene(sym_or_id):
-    eid = sym_or_id if isinstance(sym_or_id, (int, np.integer)) else {**MARKERS, **PROLIF,
-           **{v: k for k, v in repair["symbol"].items()}}[sym_or_id]
-    return logn.loc[eid] if eid in logn.index else np.log2(counts.loc[eid] / size_factors + 1)
 
-checks = [("ESR1", "ER"), ("PGR", "PR"), ("ERBB2", "HER2")]
-fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    gene_id = resolve_gene_id(sym_or_id)
+
+    if gene_id is None:
+        raise KeyError(
+            f"Gene {sym_or_id!r} was not found in the expression matrix."
+        )
+
+    return logn.loc[gene_id]
+
+
+# Compare receptor-associated gene expression.
+
+checks = [
+    ("ESR1", "ER"),
+    ("PGR", "PR"),
+    ("ERBB2", "HER2")
+]
+
+fig, axes = plt.subplots(
+    1,
+    4,
+    figsize=(16, 4)
+)
+
 rows = []
-for ax, (sym, receptor) in zip(axes, checks):
-    status = cohort[receptor].where(cohort[receptor].isin(["Positive", "Negative"]))
-    df = pd.DataFrame({"expr": gene(sym), "status": status}).dropna()
-    sns.boxplot(data=df, x="status", y="expr", order=["Negative", "Positive"], ax=ax, fliersize=1,
-                palette={"Negative": "#AAB7B8", "Positive": "#F5B041"})
-    auc = stats.mannwhitneyu(df.expr[df.status == "Positive"], df.expr[df.status == "Negative"]).statistic / (
-        (df.status == "Positive").sum() * (df.status == "Negative").sum())
-    rows.append({"gene": sym, "receptor": receptor, "AUC (expr separates status)": round(auc, 3),
-                 "median log2 expr in negative": round(df.expr[df.status == "Negative"].median(), 2),
-                 "median log2 expr in positive": round(df.expr[df.status == "Positive"].median(), 2)})
-    ax.set(title=f"{sym} by {receptor} status", xlabel=f"{receptor} (clinical)", ylabel="log2 normalised expression")
-# Sex check on all primary tumours: the 12 male patients (excluded above) act as a positive control
-cpm_pt = counts_pt / counts_pt.sum(axis=0) * 1e6
-y_score = np.log2(cpm_pt.loc[[MARKERS[g] for g in ["RPS4Y1", "DDX3Y", "KDM5D"]]] + 1).mean(axis=0)
-sex_df = pd.DataFrame({"Y-gene score": y_score, "sex": gp["SEX"].reindex(counts_pt.columns)}).dropna()
-sns.boxplot(data=sex_df, x="sex", y="Y-gene score", order=["Female", "Male"], ax=axes[3], fliersize=0,
-            palette={"Female": "#D7BDE2", "Male": "#A9CCE3"})
-sns.stripplot(data=sex_df, x="sex", y="Y-gene score", order=["Female", "Male"], ax=axes[3], size=2, color="k", alpha=0.4)
-axes[3].set(title="Y-chromosome genes (RPS4Y1, DDX3Y, KDM5D)", ylabel="mean log2(CPM + 1)", xlabel="recorded sex")
-plt.tight_layout(); plt.show()
-display(pd.DataFrame(rows))
 
-male_min = sex_df.loc[sex_df.sex == "Male", "Y-gene score"].min()
-fem_max = sex_df.loc[sex_df.sex == "Female", "Y-gene score"].max()
-print(f"Y-gene score: highest female {fem_max:.2f} vs lowest male {male_min:.2f}; "
-      f"female samples in the male range: {int((sex_df.loc[sex_df.sex == 'Female', 'Y-gene score'] >= male_min).sum())}")
+for ax, (symbol, receptor) in zip(axes, checks):
 
-# Suspicious labels: ER-negative by IHC but ESR1 mRNA at a typical ER-positive level
-esr1 = gene("ESR1")
-er_pos_q10 = esr1[cohort["ER"] == "Positive"].quantile(0.10)
-discordant = cohort.index[(cohort["group"] == "TNBC") & (esr1 > er_pos_q10)]
-print(f"TNBC tumours with ESR1 above the 10th percentile of ER-positive tumours: {len(discordant)} "
-      f"of {int(y.sum())} ({len(discordant)/y.sum():.1%})")
+    try:
+        expression = gene(symbol)
+
+    except KeyError as error:
+        print("Warning:", error)
+        ax.set_visible(False)
+        continue
+
+    status = cohort[receptor].where(
+        cohort[receptor].isin(["Positive", "Negative"])
+    )
+
+    df = pd.DataFrame({
+        "expression": expression,
+        "status": status
+    }).dropna()
+
+    positive = df.loc[
+        df["status"] == "Positive",
+        "expression"
+    ]
+
+    negative = df.loc[
+        df["status"] == "Negative",
+        "expression"
+    ]
+
+    if positive.empty or negative.empty:
+        print(
+            f"Warning: cannot compare {symbol}; "
+            "one receptor-status group is empty."
+        )
+        ax.set_visible(False)
+        continue
+
+    sns.boxplot(
+        data=df,
+        x="status",
+        y="expression",
+        order=["Negative", "Positive"],
+        ax=ax,
+        fliersize=1
+    )
+
+    # AUC based on the Mann-Whitney U statistic.
+    auc = stats.mannwhitneyu(
+        positive,
+        negative,
+        alternative="two-sided"
+    ).statistic / (
+        len(positive) * len(negative)
+    )
+
+    rows.append({
+        "gene": symbol,
+        "receptor": receptor,
+        "AUC": round(auc, 3),
+        "median negative": round(negative.median(), 2),
+        "median positive": round(positive.median(), 2)
+    })
+
+    ax.set(
+        title=f"{symbol} by {receptor} status",
+        xlabel="Clinical receptor status",
+        ylabel="log2 normalised expression"
+    )
+
+
+# Y-chromosome gene check.
+
+y_gene_symbols = [
+    "RPS4Y1",
+    "DDX3Y",
+    "KDM5D"
+]
+
+available_y_genes = [
+    symbol
+    for symbol in y_gene_symbols
+    if resolve_gene_id(symbol) is not None
+]
+
+if len(available_y_genes) == 0:
+
+    axes[3].set_visible(False)
+
+    print(
+        "Warning: no Y-chromosome genes were found "
+        "in MARKERS, PROLIF or repair."
+    )
+
+else:
+
+    y_gene_ids = [
+        resolve_gene_id(symbol)
+        for symbol in available_y_genes
+    ]
+
+    missing_y_genes = [
+        symbol
+        for symbol in available_y_genes
+        if resolve_gene_id(symbol) not in counts_pt.index
+    ]
+
+    available_y_genes = [
+        symbol
+        for symbol in available_y_genes
+        if resolve_gene_id(symbol) in counts_pt.index
+    ]
+
+    y_gene_ids = [
+        resolve_gene_id(symbol)
+        for symbol in available_y_genes
+    ]
+
+    if len(y_gene_ids) == 0:
+
+        axes[3].set_visible(False)
+
+        print(
+            "Warning: Y-chromosome genes were not present "
+            "in the primary tumour count matrix."
+        )
+
+    else:
+
+        # Calculate CPM for the primary tumour samples.
+        primary_lib_size = counts_pt.sum(axis=0).astype(np.float64)
+
+        cpm_pt = (
+            counts_pt.astype(np.float32)
+            .div(primary_lib_size.astype(np.float32), axis=1)
+            * np.float32(1e6)
+        )
+
+        y_score = np.log2(
+            cpm_pt.loc[y_gene_ids].astype(np.float32) + 1
+        ).mean(axis=0)
+
+        sex_df = pd.DataFrame({
+            "Y-gene score": y_score,
+            "sex": gp["SEX"].reindex(counts_pt.columns)
+        }).dropna()
+
+        if (
+            (sex_df["sex"] == "Female").any()
+            and (sex_df["sex"] == "Male").any()
+        ):
+
+            sns.boxplot(
+                data=sex_df,
+                x="sex",
+                y="Y-gene score",
+                order=["Female", "Male"],
+                ax=axes[3],
+                fliersize=0
+            )
+
+            sns.stripplot(
+                data=sex_df,
+                x="sex",
+                y="Y-gene score",
+                order=["Female", "Male"],
+                ax=axes[3],
+                size=2,
+                color="black",
+                alpha=0.4
+            )
+
+            axes[3].set(
+                title="Y-chromosome gene expression",
+                ylabel="Mean log2(CPM + 1)",
+                xlabel="Recorded sex"
+            )
+
+        else:
+
+            axes[3].set_visible(False)
+
+            print(
+                "Warning: male and female primary tumour samples "
+                "are both required for the Y-gene comparison."
+            )
+
+
+plt.tight_layout()
+plt.show()
+
+
+print("\nRECEPTOR-EXPRESSION CHECKS")
+
+if rows:
+    display(pd.DataFrame(rows))
+else:
+    print("No receptor-expression comparisons were completed.")
+
+
+# Compare male and female Y-gene scores.
+
+if "sex_df" in globals():
+
+    male_scores = sex_df.loc[
+        sex_df["sex"] == "Male",
+        "Y-gene score"
+    ]
+
+    female_scores = sex_df.loc[
+        sex_df["sex"] == "Female",
+        "Y-gene score"
+    ]
+
+    if male_scores.empty or female_scores.empty:
+
+        print(
+            "Male or female samples are missing "
+            "from the Y-gene comparison."
+        )
+
+    else:
+
+        male_min = male_scores.min()
+        female_max = female_scores.max()
+
+        print(
+            f"Highest female Y-gene score: {female_max:.2f}"
+        )
+
+        print(
+            f"Lowest male Y-gene score: {male_min:.2f}"
+        )
+
+        print(
+            "Female samples in the male score range:",
+            int((female_scores >= male_min).sum())
+        )
+
 
 # %% [markdown]
-# **Interpretation (Stage 3).** 
+# ### 3.6.1 Investigation of ESR1-discordant TNBC tumours
 #
-# * **Integrity:** no missing, negative or non-integer values, as expected for raw counts. 34 Entrez IDs appeared on two rows (genes annotated twice in GENCODE); we summed them, giving 40,761 unique genes.
-# * **Cohort:** 1,097 samples → 1,090 primary tumours (7 metastases removed) → 1,089 with a receptor record → 1,018 with a determinable TNBC status (71 with incomplete or indeterminate receptors excluded) → **1,006 female patients: 157 TNBC (15.6%) and 849 non-TNBC**. The 15.6% TNBC share matches the 15–20% usually reported, a first sign that the labels are sensible. The classes are imbalanced (about 1 : 5), which matters for Stage 7.
-# * **Sequencing depth:** median 57.5 M reads per tumour, almost the same in TNBC (59.4 M) and non-TNBC (57.1 M), so depth cannot explain group differences. 16 samples have small libraries for this cohort, but even the smallest has 19.2 M reads, plenty for gene-level counts. We kept them and let normalisation correct for depth.
-# * **Filtering:** 16,697 genes pass the filter, and 148 of the 156 repair genes are expressed. Some exclusions are biological: *DNTT* is only active in developing lymphocytes. Others are technical. *SLX1A/SLX1B* are duplicated copies of each other, so their reads cannot be placed uniquely. **Suspicious:** *GTF2H4* and *TOP3B* are housekeeping genes expressed in essentially every cell, yet they have a median of only ~4 reads per tumour. This is most likely a gene-annotation or read-assignment artefact (reads that overlap more than one annotated gene are discarded by gene-level counting), not true absence. We note it as a limitation rather than force them back in.
-# * **Normalisation:** size factors (0.28–2.10) track library size (r = 0.93), and the per-sample expression distributions line up after normalisation.
-# * **Biology checks pass:** *ESR1* separates ER-positive from ER-negative tumours almost perfectly (AUC 0.97; median log2 14.9 vs 8.4, about 90-fold), and *PGR* separates PR status (AUC 0.93). *ERBB2* separates HER2 status less sharply (AUC 0.81). That is expected: clinical HER2 positivity is defined by gene amplification or protein level, and equivocal cases sit in between. Every female sample's Y-gene score (maximum 2.3) is below every male sample's (minimum 5.0), so recorded sex agrees with the data.
-# * **Suspicious labels:** 5 of 157 TNBC tumours (3.2%) express *ESR1* at a level typical of ER-positive tumours. They may be IHC false negatives or ER-low tumours. We keep them, because dropping samples on the basis of expression would bias the comparison, and we list label noise as a limitation.
+# Identify TNBC tumours whose ESR1 expression is above
+# the 10th percentile of ER-positive tumours.
+#
+# These samples are flagged for review. They are not
+# automatically removed or reclassified.
+
+# %%
+# ============================================================
+# 3.6.1 ESR1-DISCORDANT TNBC INVESTIGATION
+# ============================================================
+
+esr1 = gene("ESR1")
+pgr = gene("PGR")
+
+er_positive = cohort["ER"] == "Positive"
+
+if not er_positive.any():
+    raise ValueError(
+        "No ER-positive tumours are available to calculate "
+        "the ESR1 reference percentile."
+    )
+
+er_pos_q10 = esr1.loc[
+    er_positive
+].quantile(0.10)
+
+discordant = cohort.index[
+    (cohort["group"] == "TNBC")
+    & (esr1 > er_pos_q10)
+]
+
+tnbc_count = int(y.sum())
+
+discordant_fraction = (
+    len(discordant) / tnbc_count
+    if tnbc_count > 0
+    else 0
+)
+
+print(
+    "TNBC tumours with ESR1 above the 10th percentile "
+    "of ER-positive tumours:"
+)
+
+print(
+    f"{len(discordant)} of {tnbc_count} "
+    f"({discordant_fraction:.1%})"
+)
+
+
+# Expression and assigned receptor labels.
+
+esr1_qc = pd.DataFrame({
+    "ESR1 expression": esr1.reindex(discordant),
+    "PGR expression": pgr.reindex(discordant),
+    "ER status used": cohort.loc[discordant, "ER"],
+    "PR status used": cohort.loc[discordant, "PR"],
+    "HER2 status used": cohort.loc[discordant, "HER2"]
+})
+
+
+# Original clinical receptor records.
+
+clinical_records = clin.reindex(discordant)[[
+    "ER_STATUS_BY_IHC",
+    "PR_STATUS_BY_IHC",
+    "IHC_HER2",
+    "HER2_FISH_STATUS"
+]].rename(columns={
+    "ER_STATUS_BY_IHC": "Original ER IHC record",
+    "PR_STATUS_BY_IHC": "Original PR IHC record",
+    "IHC_HER2": "Original HER2 IHC record",
+    "HER2_FISH_STATUS": "Original HER2 FISH record"
+})
+
+esr1_qc = esr1_qc.join(
+    clinical_records
+)
+
+esr1_qc.index.name = "Patient ID"
+
+print("\nESR1-DISCORDANT TNBC CASES")
+
+if esr1_qc.empty:
+    print("No ESR1-discordant TNBC cases were identified.")
+else:
+    display(esr1_qc.round(3))
+
+
+# %% [markdown]
+# ## Interpretation (Stage 3)
+#
+# This section interprets the preprocessing and quality-control
+# results, including filtering sensitivity, DNA-repair gene retention,
+# biological sanity checks and ESR1-discordant TNBC cases.
+
+# %%
+# ============================================================
+# 3.6.2 INTERPRETATION OF PREPROCESSING AND QUALITY CONTROL
+# ============================================================
+
+print("INTERPRETATION OF STAGE 3 RESULTS")
+print("=" * 60)
+
+
+# 1. Filtering sensitivity.
+
+print("\n1. GENE-FILTERING SENSITIVITY")
+
+display(sensitivity_df)
+
+print(
+    "The 10%, 15% and 25% thresholds were compared to assess "
+    "how filtering stringency affects the number of retained "
+    "genes and DNA-repair genes."
+)
+
+print(
+    f"The selected 15% threshold retained {baseline_genes:,} genes, "
+    f"including {baseline_repair:,} DNA-repair genes."
+)
+
+print(
+    "The 10% threshold is less stringent and may retain additional "
+    "low-expression genes. The 25% threshold is more stringent "
+    "and may remove genes expressed in fewer samples."
+)
+
+
+# 2. DNA-repair gene retention.
+
+print("\n2. DNA-REPAIR GENE RETENTION")
+
+print(
+    f"{len(repair_present):,} of {len(repair):,} "
+    "DNA-repair genes were retained at the 15% threshold."
+)
+
+if len(repair_dropped) > 0:
+    print(
+        "Some DNA-repair genes were removed because they did not "
+        "meet the selected expression-prevalence requirement."
+    )
+else:
+    print(
+        "All genes in the supplied DNA-repair gene set were retained."
+    )
+
+
+# 3. Normalisation.
+
+print("\n3. NORMALISATION")
+
+print(
+    "Median-of-ratios size factors were calculated using the "
+    "15%-filtered count matrix."
+)
+
+print(
+    "The normalised expression matrix contains the same genes "
+    "as the filtered count matrix."
+)
+
+print(
+    f"Normalised expression matrix dimensions: "
+    f"{logn.shape[0]:,} genes x {logn.shape[1]:,} samples."
+)
+
+
+# 4. Biological sanity checks.
+
+print("\n4. BIOLOGICAL SANITY CHECKS")
+
+if rows:
+
+    receptor_results = pd.DataFrame(rows)
+    display(receptor_results)
+
+    for _, receptor_row in receptor_results.iterrows():
+
+        print(
+            f"{receptor_row['gene']}: "
+            f"median negative = {receptor_row['median negative']}, "
+            f"median positive = {receptor_row['median positive']}, "
+            f"AUC = {receptor_row['AUC']}."
+        )
+
+else:
+
+    print(
+        "No receptor-expression comparisons were completed. "
+        "Gene availability and receptor group sizes should be reviewed."
+    )
+
+
+# 5. ESR1-discordant TNBC cases.
+
+print("\n5. ESR1-DISCORDANT TNBC CASES")
+
+print(
+    f"{len(discordant):,} of {tnbc_count:,} TNBC cases "
+    f"({discordant_fraction:.1%}) were identified as ESR1-discordant."
+)
+
+if len(discordant) > 0:
+
+    print(
+        "These cases have ESR1 expression above the 10th percentile "
+        "of the ER-positive reference group, despite being classified "
+        "as TNBC using their clinical receptor records."
+    )
+
+    print(
+        "The cases are retained in the cohort and flagged for "
+        "further review. They are not automatically reclassified "
+        "as non-TNBC because gene expression alone does not override "
+        "the clinical receptor classification."
+    )
+
+    display(esr1_qc.round(3))
+
+else:
+
+    print(
+        "No ESR1-discordant TNBC cases were identified using "
+        "the selected reference threshold."
+    )
+
+
+# 6. Overall interpretation.
+
+print("\n6. OVERALL INTERPRETATION")
+
+print(
+    "Stage 3 produced a quality-controlled primary tumour cohort, "
+    "applied a 15% expression-prevalence filter, and normalised "
+    "the filtered gene-expression matrix."
+)
+
+print(
+    "The sensitivity analysis documents how alternative filtering "
+    "thresholds affect total gene and DNA-repair gene retention."
+)
+
+print(
+    "The ESR1-discordant cases are retained and flagged for "
+    "clinical review rather than being automatically excluded "
+    "or reclassified."
+)
+
+print(
+    "The filtered and normalised expression matrix is passed "
+    "to the downstream analysis stages."
+)
+
+
+
+# %% [markdown]
+# ### 3.7 Stage 3 summary
+#
+# Summarise the actual outputs generated during preprocessing
+# and quality control.
+
+# %%
+# ============================================================
+# 3.7 STAGE 3 SUMMARY
+# ============================================================
+
+print("STAGE 3 SUMMARY")
+print("=" * 50)
+
+
+# 1. Integrity.
+
+print("\n1. COUNT MATRIX INTEGRITY")
+
+print("Missing values:", missing_values)
+print("Negative counts:", negative_counts)
+print("Non-integer counts:", non_integer_counts)
+print("Duplicated gene IDs in original matrix:", duplicate_gene_ids)
+
+print(
+    "Unique genes after merging:",
+    f"{counts_all.shape[0]:,}"
+)
+
+
+# 2. Cohort.
+
+print("\n2. COHORT SELECTION")
+
+display(
+    pd.DataFrame(flow).set_index("step")
+)
+
+print("\nFinal group composition:")
+
+display(
+    cohort["group"].value_counts().to_frame("Patients")
+)
+
+print(f"Final cohort: {len(cohort):,} patients")
+
+print(
+    f"TNBC: {int(y.sum()):,} ({y.mean():.1%})"
+)
+
+print(
+    f"non-TNBC: {int((y == 0).sum()):,} "
+    f"({(y == 0).mean():.1%})"
+)
+
+
+# 3. Sequencing depth.
+
+print("\n3. SEQUENCING DEPTH")
+
+print(
+    f"Median library size: "
+    f"{lib_size.median()/1e6:.2f} million reads"
+)
+
+print(
+    "Low-library samples flagged:",
+    int(low_lib.sum())
+)
+
+print(
+    f"Median detected genes: {detected.median():,.0f}"
+)
+
+
+# 4. Gene filtering.
+
+print("\n4. GENE FILTERING")
+
+print(f"Genes before filtering: {counts.shape[0]:,}")
+print(f"Genes after 15% filtering: {counts_f.shape[0]:,}")
+
+display(sensitivity_df)
+
+print(
+    f"DNA-repair genes retained: "
+    f"{len(repair_present)} of {len(repair)}"
+)
+
+
+# 5. Normalisation.
+
+print("\n5. NORMALISATION")
+
+print(
+    f"Median size factor: {size_factors.median():.3f}"
+)
+
+print(
+    f"Size factor range: "
+    f"{size_factors.min():.3f}–{size_factors.max():.3f}"
+)
+
+print(
+    "Correlation with library size:",
+    round(sf_lib_correlation, 3)
+)
+
+
+# 6. Biological checks.
+
+print("\n6. BIOLOGICAL SANITY CHECKS")
+
+if rows:
+    display(pd.DataFrame(rows))
+else:
+    print("No receptor-expression comparisons were completed.")
+
+
+# 7. ESR1-discordant cases.
+
+print("\n7. ESR1-DISCORDANT TNBC CASES")
+
+print(
+    f"{len(discordant)} of {tnbc_count} TNBC tumours "
+    f"({discordant_fraction:.1%})"
+)
+
+print(
+    "These cases should be reviewed using their "
+    "clinical receptor records."
+)
+
+print(
+    "Do not remove or reclassify samples based on expression alone."
+)
+
+
+# Final output variables available to later stages.
+
+print("\n8. OUTPUTS AVAILABLE FOR LATER STAGES")
+
+stage3_outputs = [
+    "counts_all",
+    "counts_pt",
+    "counts",
+    "counts_f",
+    "cohort",
+    "y",
+    "cpm",
+    "size_factors",
+    "normalised_counts",
+    "logn",
+    "sensitivity_df",
+    "esr1_qc",
+    "discordant"
+]
+
+for output in stage3_outputs:
+    print(" -", output)
+
+
+# Final consistency checks for downstream stages.
+
+assert counts_f.shape == logn.shape
+assert counts_f.index.equals(logn.index)
+assert counts_f.columns.equals(logn.columns)
+
+assert len(cohort) == counts.shape[1]
+assert len(y) == counts.shape[1]
+
+print("\nFINAL DOWNSTREAM DATA CHECKS PASSED")
+print("Filtered genes:", f"{counts_f.shape[0]:,}")
+print("Samples:", f"{counts_f.shape[1]:,}")
+print("Normalised genes:", f"{logn.shape[0]:,}")
+
+print("\nStage 3 preprocessing and quality control completed.")
 
 # %% [markdown]
 # ## Stage 4 · Exploratory data analysis
@@ -946,7 +2579,7 @@ rep_shr.to_csv(os.path.join(RESULTS_DIR, "dna_repair_DE_shrunken.csv"))
 # We use three interpretation methods:
 #
 # 1. **Pathway enrichment (GSEA pre-ranked):** genes are ranked genome-wide by the DESeq2 Wald statistic. GSEA asks whether each repair pathway sits at the TNBC-up or TNBC-down end of the ranking more than chance allows. The PAM50 proliferation genes are included as a positive control.
-# 2. **Co-expression network (NetworkX):** genes are linked when their expression is strongly correlated across tumours, then grouped into modules to see which repair genes behave as one programme.
+# 2. **Co-expression network (NetworkX):** genes are linked when their expression is strongly correlated across tumours, then grouped into modules to see which repair genes behave as one programme. We also build a protein–protein interaction (PPI) network from STRING for the significant repair genes and compare its hubs with the co-expression hubs — correlated expression and physical interaction are different kinds of evidence, so genes that are hubs in both are a stronger claim than either network alone.
 # 3. **Literature comparison.**
 
 # %%
@@ -1040,6 +2673,71 @@ ax.set_title("Co-expression network of DNA-repair genes (Spearman |ρ| ≥ 0.6)\
 ax.axis("off"); plt.tight_layout(); plt.show()
 
 # %%
+# Protein-protein interaction (PPI) network from STRING, for the *significant* repair genes
+# (rep.call != "not significant", i.e. the 116 genes that pass genome-wide FDR 0.05 — see Stage 5).
+# This is independent evidence from the co-expression network above: STRING edges come from
+# curated/experimental physical and functional interactions, not from this cohort's expression data,
+# so genes that are hubs in BOTH networks are a stronger claim than either network alone.
+from io import StringIO
+
+sig_genes = sorted(rep.loc[rep.call != "not significant", "symbol"].unique())
+print(f"{len(sig_genes)} significant repair genes queried against STRING")
+
+string_url = "https://string-db.org/api/tsv/network"
+string_params = {
+    "identifiers": "%0d".join(sig_genes),   # STRING's documented separator between identifiers
+    "species": 9606,                         # Homo sapiens
+    "required_score": 700,                   # high-confidence interactions only (STRING score is 0-1000)
+    "caller_identity": "bioproj_stage6_biological_interpretation",
+}
+req = urllib.request.Request(
+    string_url,
+    data=urllib.parse.urlencode(string_params).encode("utf-8"),
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=30) as resp:
+    string_tsv = resp.read().decode("utf-8")
+
+ppi_edges = pd.read_csv(StringIO(string_tsv), sep="\t")[["preferredName_A", "preferredName_B", "score"]].drop_duplicates()
+print(f"STRING returned {len(ppi_edges)} high-confidence (score ≥ 700) interactions")
+
+G_ppi = nx.Graph()
+G_ppi.add_nodes_from(sig_genes)
+for _, r in ppi_edges.iterrows():
+    G_ppi.add_edge(r["preferredName_A"], r["preferredName_B"], score=r["score"] / 1000)
+G_ppi.remove_nodes_from([n for n in list(G_ppi.nodes) if G_ppi.degree(n) == 0])
+print(f"PPI network: {G_ppi.number_of_nodes()} genes with >=1 interaction, {G_ppi.number_of_edges()} edges")
+
+deg_ppi = pd.Series(dict(G_ppi.degree())).sort_values(ascending=False)
+btw_ppi = pd.Series(nx.betweenness_centrality(G_ppi)).sort_values(ascending=False)
+print("top PPI hubs by degree:", ", ".join(f"{g} ({d})" for g, d in deg_ppi.head(10).items()))
+print("top PPI hubs by betweenness:", ", ".join(btw_ppi.head(6).index))
+
+# Compare against the co-expression hubs (deg, btw) computed in the cell above
+K = 10
+coexp_top, ppi_top = set(deg.head(K).index), set(deg_ppi.head(K).index)
+shared = sorted(coexp_top & ppi_top)
+print(f"\ntop-{K} hubs in BOTH networks: {', '.join(shared) if shared else '(none)'}")
+
+hub_compare = pd.DataFrame({
+    "co-expression degree": deg,
+    "co-expression rank": deg.rank(ascending=False, method="min"),
+    "PPI degree": deg_ppi.reindex(deg.index).fillna(0).astype(int),
+    "PPI rank": deg_ppi.reindex(deg.index).rank(ascending=False, method="min"),
+}).sort_values("co-expression rank").head(15)
+display(hub_compare)
+
+fig, ax = plt.subplots(figsize=(10, 9))
+pos_ppi = nx.kamada_kawai_layout(G_ppi)
+nx.draw_networkx_edges(G_ppi, pos_ppi, ax=ax, alpha=0.2, width=0.6)
+node_colors = ["#8B1E3F" if n in coexp_top else "#AEB6C4" for n in G_ppi.nodes]
+nx.draw_networkx_nodes(G_ppi, pos_ppi, ax=ax, node_size=[40 + 20 * G_ppi.degree(n) for n in G_ppi.nodes],
+                        node_color=node_colors, edgecolors="k", linewidths=0.3)
+nx.draw_networkx_labels(G_ppi, pos_ppi, ax=ax, font_size=7)
+ax.set_title(f"STRING PPI network of significant repair genes (score ≥ 0.7)\nred = also a top-{K} co-expression hub")
+ax.axis("off"); plt.tight_layout(); plt.show()
+
+# %%
 # BRCA1: TNBC is known to contain BRCA1-deficient tumours (germline mutation or promoter methylation).
 # Expression alone cannot show deficiency, but a low-expression tail would be consistent with silencing.
 b1 = logn.loc[sym2id["BRCA1"]]
@@ -1068,14 +2766,32 @@ plt.tight_layout(); plt.show()
 # | TNBC separate from non-TNBC across the whole transcriptome and are far more proliferative (PCA; proliferation z 0.95 vs −0.09) | Most TNBC are basal-like, the most proliferative intrinsic subtype (Perou et al., 2000; TCGA Network, 2012) | Agrees |
 # | HR, FA and checkpoint genes (*FANCA, RAD54L, CHEK1, RAD51AP1, EXO1, BLM*) are the most up-regulated repair genes in TNBC | The basal-like TNBC subtypes BL1/BL2 have high cell-cycle and DNA-damage-response gene expression (Lehmann et al., 2011) | Agrees |
 # | Most of that up-regulation disappears after adjusting for proliferation; the up-regulated genes form one module tied to proliferation | Many replication-coupled repair genes are periodically expressed in the cell cycle and appear in tumour proliferation signatures (Whitfield et al., 2002) | Agrees, and explains our result |
-# | *BRCA1* is lower than proliferation predicts in TNBC, with a low-expression tail in 16.6% of TNBC | Sporadic TNBC often share features of *BRCA1*-mutant cancers ("BRCAness"), and *BRCA1* can be silenced by promoter methylation in sporadic breast tumours (Turner et al., 2004; Esteller et al., 2000; Foulkes et al., 2010) | Consistent; needs methylation or mutation data to confirm |
+# | *BRCA1* is lower than proliferation predicts in TNBC, with a low-expression tail in 16.6% of TNBC | Sporadic TNBC often share features of *BRCA1*-mutant cancers ("BRCAness"), and *BRCA1* can be silenced by promoter methylation in sporadic breast tumours (Turner et al., 2007; Esteller et al., 2000; Foulkes et al., 2010) | Consistent; needs methylation or mutation data to confirm |
 # | HR genes such as *RAD51* and *BRCA2* are *higher* in TNBC, the subtype most associated with HR deficiency | HR deficiency is a functional state, detected through mutations, methylation or genomic "scars" (Knijnenburg et al., 2018; Davies et al., 2017), not mRNA levels | Paradox explained: expression ≠ function |
 # | TNBC patients are younger and more often Black / African American | Basal-like breast cancer is more prevalent in younger African-American women (Carey et al., 2006) | Agrees |
 #
-# **Interpretation (Stage 6).** 
+# ### References
+#
+# Every reference below was checked against the publisher/journal record. One correction was found: the
+# literature table previously cited the BRCA1-dysfunction paper as "Turner et al., 2004" — the paper was
+# published online 2 Oct 2006 and in print in 2007, so it is cited here as **Turner et al., 2007**.
+#
+# 1. Perou CM, Sørlie T, Eisen MB, et al. Molecular portraits of human breast tumours. *Nature*. 2000;406(6797):747–752. doi: [10.1038/35021093](https://doi.org/10.1038/35021093)
+# 2. The Cancer Genome Atlas Network. Comprehensive molecular portraits of human breast tumours. *Nature*. 2012;490(7418):61–70. doi: [10.1038/nature11412](https://doi.org/10.1038/nature11412)
+# 3. Whitfield ML, Sherlock G, Saldanha AJ, et al. Identification of genes periodically expressed in the human cell cycle and their expression in tumors. *Mol Biol Cell*. 2002;13(6):1977–2000. doi: [10.1091/mbc.02-02-0030](https://doi.org/10.1091/mbc.02-02-0030)
+# 4. Lehmann BD, Bauer JA, Chen X, et al. Identification of human triple-negative breast cancer subtypes and preclinical models for selection of targeted therapies. *J Clin Invest*. 2011;121(7):2750–2767. doi: [10.1172/JCI45014](https://doi.org/10.1172/JCI45014)
+# 5. Turner NC, Reis-Filho JS, Russell AM, et al. BRCA1 dysfunction in sporadic basal-like breast cancer. *Oncogene*. 2007;26:2126–2132 (published online 2 Oct 2006). doi: [10.1038/sj.onc.1210014](https://doi.org/10.1038/sj.onc.1210014) — *corrected from "2004" in the table above.*
+# 6. Esteller M, Silva JM, Dominguez G, et al. Promoter hypermethylation and BRCA1 inactivation in sporadic breast and ovarian tumors. *J Natl Cancer Inst*. 2000;92(7):564–569. doi: [10.1093/jnci/92.7.564](https://doi.org/10.1093/jnci/92.7.564)
+# 7. Foulkes WD, Smith IE, Reis-Filho JS. Triple-negative breast cancer. *N Engl J Med*. 2010;363(20):1938–1948. doi: [10.1056/NEJMra1001389](https://doi.org/10.1056/NEJMra1001389)
+# 8. Knijnenburg TA, Wang L, Zimmermann MT, et al. Genomic and molecular landscape of DNA damage repair deficiency across The Cancer Genome Atlas. *Cell Rep*. 2018;23(1):239–254.e6. doi: [10.1016/j.celrep.2018.03.076](https://doi.org/10.1016/j.celrep.2018.03.076)
+# 9. Davies H, Glodzik D, Morganella S, et al. HRDetect is a predictor of BRCA1 and BRCA2 deficiency based on mutational signatures. *Nat Med*. 2017;23(4):517–525. doi: [10.1038/nm.4292](https://doi.org/10.1038/nm.4292)
+# 10. Carey LA, Perou CM, Livasy CA, et al. Race, breast cancer subtypes, and survival in the Carolina Breast Cancer Study. *JAMA*. 2006;295(21):2492–2502. doi: [10.1001/jama.295.21.2492](https://doi.org/10.1001/jama.295.21.2492)
+#
+# **Interpretation (Stage 6).**
 #
 # * **Pathway enrichment:** the proliferation control is the most enriched set (NES 2.19, FDR < 0.001), which shows the method works. Among repair pathways, only **homologous recombination is significantly enriched towards TNBC** (NES 1.81, FDR 0.009). MMR (NES 1.50, FDR 0.065), all repair genes together (NES 1.56, FDR 0.057) and FA (NES 1.40, FDR 0.10) point the same way without reaching significance. BER, NER and NHEJ show no enrichment (FDR ≥ 0.48). The HR leading-edge genes (*CHEK1, RFC4, RAD54L, RAD51AP1, RAD51B, POLD1 …*) are the same genes highlighted in Stage 5.
 # * **Co-expression network:** 55 repair genes have at least one strong co-expression partner. Most of them form one dense core made of two modules (25 + 13 genes) whose hubs are *RAD51AP1, EXO1, FANCB, BLM, CHEK1, NEIL3, RAD54L* and *RAD51*. Both module scores correlate strongly with proliferation (ρ = 0.85 and 0.88) and are higher in TNBC (AUC 0.80 and 0.79). After proliferation adjustment, though, their median TNBC difference is close to zero (0.14 and −0.02). This is a **single replication-coupled HR/FA programme** that switches on in dividing cells, and TNBC divide more. A separate small module (*MSH3, RAD50, POLK, FAN1, RAD17*) behaves differently. It is **lower in TNBC** (AUC 0.16, i.e. higher in non-TNBC), not tied to proliferation (ρ = −0.31), and keeps its difference after adjustment (median −0.53). This is the clearest proliferation-independent repair difference in the data.
+# * **PPI vs co-expression hubs:** `# TODO (Kian) — replace with what your own run prints.` Run the new STRING cell above in Colab and read off: (a) how many of the top-10 co-expression hubs (`RAD51AP1, EXO1, FANCB, BLM, CHEK1, …`) are *also* top-10 STRING PPI hubs — printed as "top-10 hubs in BOTH networks"; (b) name any gene that is a hub in one network but not the other, and say what that means (a co-expression-only hub is "co-regulated but not known to physically interact"; a PPI-only hub is "interacts physically but isn't co-regulated here"). A gene that is a hub in *both* networks (shared regulation **and** shared physical interaction) is the strongest candidate for a real functional module — call that out by name once you have it.
 # * **BRCA1:** median *BRCA1* expression is the same in both groups (9.97 vs 9.95), but TNBC have a long low tail: 16.6% of TNBC fall below the 5th percentile of non-TNBC (5.1% expected). Given how proliferative TNBC are, *BRCA1* is lower than expected (p = 7.8 × 10⁻⁹). This fits a subset of TNBC in which *BRCA1* is silenced (the BRCAness phenotype), while most TNBC have normal *BRCA1* driven up by proliferation. Expression alone cannot prove repair deficiency.
 # * **Overall:** our results support the literature on direction (HR/FA up in TNBC, a BRCA1-low subset) but show that **most of the repair difference is proliferation**, a point often left out when repair-gene expression is compared between subtypes.
 
@@ -1315,13 +3031,13 @@ print(f"{len(overlap)} of the top 15 permutation genes are also in the top 20 co
 # %% [markdown]
 # **Interpretation (Stage 7).** 
 #
-# * **Model selection (training set, 5-fold CV):** logistic regression with strong regularisation (C = 0.01) did best (CV ROC-AUC 0.970), slightly ahead of the random forest (0.951).
+# * **Model selection (training set, 5-fold CV):** logistic regression with strong regularisation (C = 0.01) did best (CV ROC-AUC 0.970), slightly ahead of the random forest (0.950).
 # * **Against the baselines:** the repair-gene model clearly beats the majority-class baseline (AUC 0.50) and the proliferation-only model (CV 0.84, test 0.83). So repair genes carry information beyond "this tumour divides fast", and adding the proliferation score to them adds nothing. **But 30 random sets of 148 non-repair genes do just as well.**
-# * **Repeated cross-validation (5 × 5, same splits for every model):** this confirms the point above and makes it sharper. The repair-gene model scores 0.969 ± 0.013 and the random gene sets 0.967 ± 0.013. Scored on identical folds, the repair genes are ahead by only +0.002 AUC (SD 0.008) and win in just 60% of the comparisons. They beat 77% of the random-set means, down from 93% with the single 5-fold split, so the single split flattered the repair genes. The proliferation-only model is not only weaker (0.843) but also the least stable (SD 0.045, range 0.74–0.91).
+# * **Repeated cross-validation (5 × 5, same splits for every model):** this confirms the point above and makes it sharper. The repair-gene model scores 0.969 ± 0.013 and the random gene sets 0.967 ± 0.013. Scored on identical folds, the repair genes are ahead by only +0.002 AUC (SD 0.008) and win in just 61% of the comparisons. They beat 77% of the random-set means, down from 93% with the single 5-fold split, so the single split flattered the repair genes. The proliferation-only model is not only weaker (0.840) but also the least stable (SD 0.045, range 0.73–0.91).
 # * **Test set (used once):** the repair-gene logistic regression reaches **ROC-AUC 0.93 (95% CI 0.87–0.97)** and PR-AUC 0.66 (chance level 0.16). Balanced accuracy is 0.87, with sensitivity 0.81 (26 of 32 TNBC found) and specificity 0.93 (158 of 170 non-TNBC correct). The test AUC is a little lower than CV (0.93 vs 0.97); with only 32 TNBC in the test set this is within the uncertainty, and nothing was tuned on the test set.
-# * **Random forest threshold:** at the default 0.5 threshold the random forest finds only 14 of 32 TNBC, because its probabilities for the rare class are low. A threshold of 0.25, chosen on training out-of-fold predictions only, raises test sensitivity from 44% to 75% (24 of 32) and balanced accuracy from 0.70 to 0.84. Specificity drops slightly (0.96 → 0.92), and ROC-AUC is unchanged (0.915) because it does not depend on the threshold. Even tuned, the random forest stays below the logistic regression (balanced accuracy 0.84 vs 0.87), so logistic regression remains our preferred model.
+# * **Random forest threshold:** at the default 0.5 threshold the random forest finds only 14 of 32 TNBC, because its probabilities for the rare class are low. A threshold of 0.22, chosen on training out-of-fold predictions only, raises test sensitivity from 44% to 78% (25 of 32) and balanced accuracy from 0.70 to 0.85. Specificity drops slightly (0.97 → 0.92), and ROC-AUC is unchanged (0.919) because it does not depend on the threshold. Even tuned, the random forest stays below the logistic regression (balanced accuracy 0.85 vs 0.87), so logistic regression remains our preferred model.
 # * **What the model uses:** the largest coefficients are *FANCE, SEM1, RAD51B, GTF2H1, ATM* (towards TNBC) and *ATRIP, RAD50, RAD17, POLL, POLD4, POLN* (towards non-TNBC). The coefficients correlate with the proliferation-adjusted differences from Stage 5 (ρ = 0.84). The model relies on the proliferation-independent part of the repair profile, the same genes our statistics highlighted.
-# * **Permutation importance:** no single gene matters much. Shuffling the most important gene, *ATM*, lowers test AUC by only 0.006, and only 67 of the 148 genes have any measurable effect. 9 of the top 15 genes (*ATM, DCLRE1C, FANCA, PARP4, POLD4, POLL, POLN, RAD51B, XPA*) are also among the top 20 coefficients, so the two methods broadly agree. The information is spread across many correlated genes, which is also why random gene sets can do the same job.
+# * **Permutation importance:** no single gene matters much. Shuffling the most important gene, *ATM*, lowers test AUC by only 0.006, and only 72 of the 148 genes have any measurable effect. 9 of the top 15 genes (*ATM, DCLRE1C, FANCA, PARP4, POLD4, POLL, POLN, RAD51B, XPA*) are also among the top 20 coefficients, so the two methods broadly agree. The information is spread across many correlated genes, which is also why random gene sets can do the same job.
 # * **Honest conclusion:** DNA-repair expression classifies TNBC well, but that does **not** show repair genes are special. TNBC are so different transcriptome-wide that almost any 148 genes would do. The classifier confirms a distinct profile; it is not evidence of a repair-specific biomarker.
 
 # %% [markdown]
@@ -1347,22 +3063,22 @@ display(pd.Series(summary, name="key result").to_frame())
 # ### Answer to the research question
 # **Yes, TNBC show a distinct DNA-repair expression profile, but most of it reflects their higher proliferation.**
 #
-# 116 of 148 repair genes differ at FDR < 0.05, and the set as a whole is shifted towards higher expression in TNBC more than random genes (p = 0.0003), so we reject H0. The predicted direction (HR/FA/MMR up in TNBC) holds, but adjusting for proliferation removes most of it: only 38 genes stay higher, and more genes (67) become *lower* than proliferation predicts. The proliferation-independent signal is:
+# 116 of 148 repair genes differ at FDR < 0.05, and the set as a whole is shifted towards higher expression in TNBC more than random genes (p = 0.0003), so we reject H0. The predicted direction (HR/FA/MMR up in TNBC) holds, but adjusting for proliferation removes most of it: only 36 genes stay higher, and more genes (71) become *lower* than proliferation predicts, with a median of just 26% of the TNBC difference retained. The proliferation-independent signal is:
 #
 # * FA-core and checkpoint genes (*FANCE, FANCA, USP1, CHEK1*) and *RAD51B* stay higher in TNBC.
-# * ***BRCA1***, a *RAD50/MSH3/POLK/RAD17/FAN1* module and *POLN* are lower than expected.
+# * ***BRCA1***, *POLN*, *POLD4* and a *RAD50/MSH3/POLK/RAD17/FAN1* module are lower than expected.
 #
 # ### One point per objective
-# 1. **Cohort (O1):** we built a quality-controlled count matrix for 1,006 female primary tumours (157 TNBC, 849 non-TNBC). The labels passed biological checks (*ESR1* AUC 0.97, *PGR* 0.93, recorded sex consistent with Y-gene expression). Only 5 TNBC (3.2%) look ER-positive at the mRNA level.
-# 2. **Differential expression (O2):** 79 repair genes are up and 37 down in TNBC (FDR < 0.05), and 11 change at least two-fold (10 up, led by *FANCA, RAD54L, CHEK1*; 1 down, *POLN*). The Wilcoxon test confirms the direction for 94% of genes. As a set, repair genes are shifted *up* in TNBC, but they are not more strongly changed than random genes.
-# 3. **Biological interpretation (O3):** homologous recombination is the only significantly enriched pathway (GSEA NES 1.81, FDR 0.009). The up-regulated genes form one co-expressed, replication-coupled HR/FA module that tracks proliferation (ρ ≈ 0.85–0.88). Two findings do not depend on proliferation: *BRCA1* is lower than expected in TNBC, with a low tail in 16.6% of tumours (consistent with BRCAness), and a down-regulated *RAD50/MSH3/POLK* module.
-# 4. **Machine learning (O4):** a logistic regression on repair genes reaches test ROC-AUC 0.93 (95% CI 0.87–0.97), balanced accuracy 0.87, sensitivity 0.81 and specificity 0.93, clearly beating the majority-class (0.50) and proliferation-only (0.83) baselines. Random gene sets of the same size perform just as well (CV AUC 0.966 vs 0.970). So the classifier confirms a distinct profile but **does not show that repair genes are uniquely informative**.
+# 1. **Cohort and data (O1):** we built a quality-controlled count matrix from open-access TCGA-BRCA RNA-seq counts (40,796 genes × 1,097 tumours, SHA-256-verified against a pinned GDC mirror and holding all 156 repair genes). Keeping one primary tumour per patient with determinable receptor status gives 1,006 female tumours (157 TNBC, 849 non-TNBC; 15.6% TNBC); a 15% expression filter retains 16,697 genes including 148 of 156 repair genes (stable at 10%/25%: 149/147). The labels passed biological checks (*ESR1* AUC 0.965, *PGR* 0.928, *ERBB2* 0.809), and only 5 TNBC (3.2%) look ER-positive at the mRNA level — kept and flagged, not reclassified.
+# 2. **Differential expression (O2):** 79 repair genes are up and 37 down in TNBC (FDR < 0.05), and 11 change at least two-fold (10 up, led by *FANCA, RAD54L, CHEK1*; 1 down, *POLN*); the result is robust to age (log2FC *r* = 1.00). The Wilcoxon test confirms the DESeq2 direction for 94% of genes. As a set, repair genes are shifted *up* in TNBC more than random genes (mean Wald 2.64 vs 0.49, p = 0.0003), but in magnitude they are no more changed than random (mean |Wald| 6.63 vs 6.46, p = 0.33).
+# 3. **Biological interpretation (O3):** homologous recombination is the only significantly enriched pathway (GSEA NES 1.80, FDR 0.010). The up-regulated genes form two co-expressed, replication-coupled HR/FA modules that track proliferation (ρ ≈ 0.84–0.91), and a STRING protein–protein network of the significant repair genes (114 genes, 1,523 high-confidence edges) shares its top hubs with the co-expression network — *EXO1, FANCD2* and *RAD51* rank in the top 10 of both. Two findings do not depend on proliferation: *BRCA1* is lower than expected in TNBC (median residual −0.25; a low tail in 16.6% of tumours, consistent with BRCAness), and a down-regulated *RAD50/MSH3/POLK* module.
+# 4. **Machine learning (O4):** on the held-out test set (202 tumours, 32 TNBC), a logistic regression on repair genes reaches test ROC-AUC 0.93 (95% CI 0.87–0.97; 5 × 5 repeated CV 0.969 ± 0.013), balanced accuracy 0.87, sensitivity 0.81 and specificity 0.93, clearly beating the majority-class (0.50) and proliferation-only (0.83) baselines. But random sets of 148 non-repair genes do just as well (0.967 ± 0.013; repair genes ahead in only 61% of paired folds), and tuning the random-forest threshold to 0.22 lifts balanced accuracy from 0.70 to 0.85 (TNBC recall 0.44 → 0.78). So the classifier confirms a distinct profile but **does not show that repair genes are uniquely informative**.
 #
 # ### Limitations
 # * **Expression ≠ function.** High HR-gene mRNA does not mean HR works, and low *BRCA1* mRNA does not prove deficiency. We used no mutation, methylation or genomic-scar data.
 # * **Proliferation adjustment is imperfect.** The 11-gene score is a proxy, so some confounding may remain. Adjustment may also remove real biology if repair changes themselves drive proliferation.
 # * **Bulk tumour RNA.** Each sample mixes tumour, stromal and immune cells. We did not adjust for tumour purity, and TNBC often have more immune infiltration.
-# * **Label noise.** Receptor status was scored at many hospitals over many years under older guidelines. 71 tumours with incomplete status were excluded, and 5 TNBC have *ESR1* at ER-positive levels. Two housekeeping repair genes (*GTF2H4, TOP3B*) had implausibly low counts, a likely annotation artefact.
+# * **Label noise.** Receptor status was scored at many hospitals over many years under older guidelines. 71 tumours with incomplete status were excluded, and 5 TNBC have *ESR1* at ER-positive levels. Eight repair genes (e.g. *GTF2H4, TOP3B*) fell below the expression filter and were not tested.
 # * **Representation.** Most patients are White (57–70%), about 5% Asian, and none were recruited in Africa. The results may not transfer to Kenyan or other African patients.
 # * **One dataset.** The analysis is cross-sectional with no external validation, and the test set holds only 32 TNBC, so the metrics have wide confidence intervals.
 #
@@ -1373,7 +3089,7 @@ display(pd.Series(summary, name="key result").to_frame())
 # * Relate the repair profile to treatment response (platinum, PARP inhibitors) and survival.
 #
 # ### Code and outputs
-# This notebook runs top to bottom in Google Colab. It is stored on GitHub with its outputs, together with the result tables written to `results/` (repair-gene DE table, proliferation-adjusted table, GSEA table, ML test metrics).
+# This notebook runs top to bottom in Google Colab. It is stored on GitHub with its outputs, together with the result tables written to `results/` (repair-gene DE, shrunken and age- and proliferation-adjusted tables, the genome-wide DE table, the GSEA table and the ML test metrics).
 
 # %% [markdown]
 # ## References
