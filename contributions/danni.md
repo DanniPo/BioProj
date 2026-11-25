@@ -33,7 +33,7 @@
 - **Notebook check (GitHub Actions)** passed on my Stage 7 branch: [run 44344268107](https://github.com/DanniPo/BioProj/actions/runs/44344268107).
 - **Earlier numbers unchanged:** confirmed my new cells didn't change anything already in the notebook. The bootstrap CI stayed the same, because my code uses its own random generator.
 - **Final notebook:** `python build_notebook.py --check` reports that the notebook matches `stages/`. All 41 code cells have outputs, with no errors. Final run: [run 45631750622](https://github.com/DanniPo/BioProj/actions/runs/45631750622).
-- **Colab:** ran the notebook top to bottom. Screenshot: `<img width="1667" height="1067" alt="image" src="https://github.com/user-attachments/assets/f49850be-ffda-4c96-9326-4d96e560f386" /> <img width="1172" height="1012" alt="image" src="https://github.com/user-attachments/assets/0502866d-090e-42a1-9fa0-56bf53e8a0ce" /> `
+- **Colab:** ran the notebook top to bottom. Screenshot: <img width="1667" height="1067" alt="image" src="https://github.com/user-attachments/assets/f49850be-ffda-4c96-9326-4d96e560f386" /> <img width="1172" height="1012" alt="image" src="https://github.com/user-attachments/assets/0502866d-090e-42a1-9fa0-56bf53e8a0ce" /> 
 
 `.
 
